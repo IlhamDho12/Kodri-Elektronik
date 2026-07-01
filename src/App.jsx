@@ -32,8 +32,10 @@ import {
 import { dbService, isMock, supabase } from './services/db';
 import logoImg from './assets/logo.png';
 
-const APP_PASSWORD_HASH = (import.meta.env.VITE_APP_PASSWORD_HASH || '').trim().toLowerCase();
-const APP_PASSWORD_SALT = (import.meta.env.VITE_APP_PASSWORD_SALT || '').trim();
+const DEFAULT_PASSWORD_SALT = '17771ce61d10fe687077b2dee83e8715';
+const DEFAULT_PASSWORD_HASH = '25f841295997c771cf117ca7d16ce3df3653bf35d50c56d596068ae9cb132f80';
+const APP_PASSWORD_HASH = (import.meta.env.VITE_APP_PASSWORD_HASH || DEFAULT_PASSWORD_HASH).trim().toLowerCase();
+const APP_PASSWORD_SALT = (import.meta.env.VITE_APP_PASSWORD_SALT || DEFAULT_PASSWORD_SALT).trim();
 const SUPABASE_AUTH_EMAIL = (import.meta.env.VITE_SUPABASE_AUTH_EMAIL || '').trim();
 
 const hashPasscode = async (passcode) => {
