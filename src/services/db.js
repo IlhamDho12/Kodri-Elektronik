@@ -8,6 +8,7 @@ const isCloudConfigured = supabaseUrl.trim() !== '' && supabaseKey.trim() !== ''
 
 export const supabase = isCloudConfigured ? createClient(supabaseUrl, supabaseKey) : null;
 export const isMock = !isCloudConfigured;
+export const isCloud = isCloudConfigured;
 
 // ----------------------------------------------------
 // DUMMY / INITIAL DATA UNTUK LOCAL STORAGE
@@ -84,13 +85,13 @@ export const dbService = {
         .single();
       if (error) throw error;
 
-      // Buat entri stok lokasi awal (0 jika tidak diisi)
+      // Trigger database membuat stok lokasi awal. Upsert menjaga schema lama/baru tetap aman.
       const { error: stockError } = await supabase
         .from('stok_lokasi')
-        .insert([
+        .upsert([
           { produk_id: data.id, lokasi: 'Rumah', jumlah: product.stok_rumah || 0 },
           { produk_id: data.id, lokasi: 'Pasar', jumlah: product.stok_pasar || 0 }
-        ]);
+        ], { onConflict: 'produk_id,lokasi' });
       if (stockError) throw stockError;
 
       return { ...data, stok_rumah: product.stok_rumah || 0, stok_pasar: product.stok_pasar || 0 };
@@ -348,6 +349,7 @@ export const dbService = {
           nama_supplier: purchase.nama_supplier,
           total_nota: purchase.total_nota,
           status: purchase.status,
+          foto_nota: purchase.foto_nota || null,
           tanggal: new Date().toISOString()
         }])
         .select()
@@ -373,17 +375,19 @@ export const dbService = {
           .select('jumlah')
           .eq('produk_id', item.produk_id)
           .eq('lokasi', item.lokasi_tujuan)
-          .single();
+          .maybeSingle();
         if (fetchStockErr) throw fetchStockErr;
 
-        const newStockAmount = stockItem.jumlah + item.jumlah;
+        const newStockAmount = (stockItem?.jumlah || 0) + item.jumlah;
 
         // Update stok di lokasi tujuan
         const { error: updateStockErr } = await supabase
           .from('stok_lokasi')
-          .update({ jumlah: newStockAmount })
-          .eq('produk_id', item.produk_id)
-          .eq('lokasi', item.lokasi_tujuan);
+          .upsert([{
+            produk_id: item.produk_id,
+            lokasi: item.lokasi_tujuan,
+            jumlah: newStockAmount
+          }], { onConflict: 'produk_id,lokasi' });
         if (updateStockErr) throw updateStockErr;
 
         // Update harga beli default produk

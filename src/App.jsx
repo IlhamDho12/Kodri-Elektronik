@@ -29,7 +29,7 @@ import {
   Unlock,
   LogOut
 } from 'lucide-react';
-import { dbService, isMock, supabase } from './services/db';
+import { dbService, isCloud, isMock, supabase } from './services/db';
 import logoImg from './assets/logo.png';
 
 const DEFAULT_PASSWORD_SALT = '17771ce61d10fe687077b2dee83e8715';
@@ -252,6 +252,13 @@ function App() {
   // Login Handle
   const handleLogin = async (e) => {
     e.preventDefault();
+
+    if (isCloud && !useSupabaseAuth) {
+      setPasscodeError(true);
+      setPasscode('');
+      showToast('Cloud aktif, tapi email login Supabase belum dikonfigurasi.', 'error');
+      return;
+    }
 
     if (!useSupabaseAuth && !useLocalPasscode) {
       setPasscodeError(true);
@@ -2505,7 +2512,8 @@ function ProductsView({ products, formatRupiah, fetchData, showToast, showConfir
       showToast(`Produk "${formData.nama}" berhasil didaftarkan!`, 'success');
       fetchData();
     } catch (err) {
-      showToast('Gagal menambah produk.', 'error');
+      console.error('Gagal menambah produk:', err);
+      showToast(`Gagal menambah produk: ${err.message || 'cek koneksi Supabase'}`, 'error');
     }
   };
 
@@ -2524,7 +2532,8 @@ function ProductsView({ products, formatRupiah, fetchData, showToast, showConfir
       showToast('Stok & harga produk berhasil disesuaikan!', 'success');
       fetchData();
     } catch (err) {
-      showToast('Gagal menyimpan penyesuaian.', 'error');
+      console.error('Gagal menyimpan penyesuaian produk:', err);
+      showToast(`Gagal menyimpan penyesuaian: ${err.message || 'cek koneksi Supabase'}`, 'error');
     }
   };
 
@@ -2928,7 +2937,8 @@ function PurchasesView({ products, purchases, formatRupiah, fetchData, setActive
       fetchData();
       setActiveTab('dashboard'); 
     } catch (err) {
-      showToast('Gagal mencatat Nyambut Barang.', 'error');
+      console.error('Gagal mencatat Nyambut Barang:', err);
+      showToast(`Gagal mencatat Nyambut Barang: ${err.message || 'cek koneksi Supabase'}`, 'error');
     }
   };
 
@@ -2948,7 +2958,8 @@ function PurchasesView({ products, purchases, formatRupiah, fetchData, setActive
       await fetchData(); 
       setSelectedProdId(newProd.id); 
     } catch (err) {
-      showToast('Gagal mendaftarkan produk baru.', 'error');
+      console.error('Gagal mendaftarkan produk baru:', err);
+      showToast(`Gagal mendaftarkan produk baru: ${err.message || 'cek koneksi Supabase'}`, 'error');
     }
   };
 
