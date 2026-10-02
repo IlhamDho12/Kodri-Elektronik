@@ -1,10 +1,9 @@
-import React, { useState, useEffect } from 'react';
+import React, { useState, useEffect, useMemo, useRef, useLayoutEffect } from 'react';
 import { 
   LayoutDashboard, 
   ShoppingCart, 
   Package, 
   FileText, 
-  Plus, 
   Search, 
   Trash2, 
   PlusCircle, 
@@ -25,26 +24,51 @@ import {
   Camera,
   Eye,
   Image as ImageIcon,
-  Lock,
-  Unlock,
-  LogOut
 } from 'lucide-react';
-import { dbService, isCloud, isMock, supabase } from './services/db';
+import { dbService, isMock } from './services/db';
+import { downloadExcelBackup, parseExcelBackup } from './services/excelBackup';
+import { runDailyDemoAutomation } from './services/demoAutomation';
+import { hasWriteAccess, saveWriteAccess, unlockWriteAccess } from './services/writeAccess';
 import logoImg from './assets/logo.png';
 
-const DEFAULT_PASSWORD_SALT = '17771ce61d10fe687077b2dee83e8715';
-const DEFAULT_PASSWORD_HASH = '25f841295997c771cf117ca7d16ce3df3653bf35d50c56d596068ae9cb132f80';
-const APP_PASSWORD_HASH = (import.meta.env.VITE_APP_PASSWORD_HASH || DEFAULT_PASSWORD_HASH).trim().toLowerCase();
-const APP_PASSWORD_SALT = (import.meta.env.VITE_APP_PASSWORD_SALT || DEFAULT_PASSWORD_SALT).trim();
-const SUPABASE_AUTH_EMAIL = (import.meta.env.VITE_SUPABASE_AUTH_EMAIL || '').trim();
+const getNominalDigits = (value) => String(value ?? '').replace(/\D/g, '');
+const formatNominal = (value) => getNominalDigits(value).replace(/\B(?=(\d{3})+(?!\d))/g, '.');
+const parseNominal = (value) => Number(getNominalDigits(value)) || 0;
 
-const hashPasscode = async (passcode) => {
-  const encoded = new TextEncoder().encode(`${APP_PASSWORD_SALT}:${passcode}`);
-  const hashBuffer = await crypto.subtle.digest('SHA-256', encoded);
-  return Array.from(new Uint8Array(hashBuffer))
-    .map((byte) => byte.toString(16).padStart(2, '0'))
-    .join('');
-};
+function NominalInput({ value, onValueChange, ...props }) {
+  const inputRef = useRef(null);
+  const caretDigitCount = useRef(null);
+
+  useLayoutEffect(() => {
+    if (caretDigitCount.current === null || document.activeElement !== inputRef.current) return;
+    const digitCount = caretDigitCount.current;
+    const formattedValue = formatNominal(value);
+    let position = 0;
+    let digitsFound = 0;
+    while (position < formattedValue.length && digitsFound < digitCount) {
+      if (/\d/.test(formattedValue[position])) digitsFound += 1;
+      position += 1;
+    }
+    inputRef.current.setSelectionRange(position, position);
+    caretDigitCount.current = null;
+  }, [value]);
+
+  return (
+    <input
+      {...props}
+      ref={inputRef}
+      type="text"
+      inputMode="numeric"
+      value={formatNominal(value)}
+      onChange={(event) => {
+        const input = event.currentTarget;
+        const cursor = input.selectionStart ?? input.value.length;
+        caretDigitCount.current = getNominalDigits(input.value.slice(0, cursor)).length;
+        onValueChange(getNominalDigits(input.value));
+      }}
+    />
+  );
+}
 
 // Helper to compress image client-side to maximum 800px width/height and 60% quality
 const compressImage = (file, callback) => {
@@ -89,11 +113,6 @@ function App() {
   // Fix #12: Baca tema dari localStorage agar persisten setelah refresh
   const [theme, setTheme] = useState(() => localStorage.getItem('kod_theme') || 'light');
   
-  // Auth States
-  const [isAuthenticated, setIsAuthenticated] = useState(false);
-  const [passcode, setPasscode] = useState('');
-  const [passcodeError, setPasscodeError] = useState(false);
-  
   // Data States
   const [products, setProducts] = useState([]);
   const [transactions, setTransactions] = useState([]);
@@ -105,6 +124,12 @@ function App() {
   const [toast, setToast] = useState({ show: false, type: 'success', message: '' });
   const [printType, setPrintType] = useState('receipt'); // receipt atau report
   const [lastTxData, setLastTxData] = useState(null);
+  const [printProducts, setPrintProducts] = useState([]);
+  const [writeUnlocked, setWriteUnlocked] = useState(() => hasWriteAccess());
+  const [writeAccessModal, setWriteAccessModal] = useState(false);
+  const [writeAccessCode, setWriteAccessCode] = useState('');
+  const [writeAccessError, setWriteAccessError] = useState('');
+  const [pendingWrite, setPendingWrite] = useState(null);
   
   // Custom Confirmation Dialog state
   const [confirmModal, setConfirmModal] = useState({
@@ -128,14 +153,48 @@ function App() {
       }
     });
   };
+
+  const requestWriteAccess = (action) => {
+    if (writeUnlocked) {
+      action();
+      return;
+    }
+    setPendingWrite(() => action);
+    setWriteAccessCode('');
+    setWriteAccessError('');
+    setWriteAccessModal(true);
+  };
+
+  useEffect(() => {
+    const handleExpiredAccess = () => setWriteUnlocked(false);
+    window.addEventListener('kodri:write-access-expired', handleExpiredAccess);
+    return () => window.removeEventListener('kodri:write-access-expired', handleExpiredAccess);
+  }, []);
+
+  const handleWriteAccessSubmit = async (event) => {
+    event.preventDefault();
+    setWriteAccessError('');
+    try {
+      if (isMock && import.meta.env.DEV) {
+        if (writeAccessCode !== '7768') throw new Error('Kode akses salah. Silakan coba lagi.');
+        saveWriteAccess({ token: 'local-development-only', expiresAt: Date.now() + 8 * 60 * 60 * 1000 });
+      } else {
+        await unlockWriteAccess(writeAccessCode);
+      }
+      setWriteUnlocked(true);
+      setWriteAccessModal(false);
+      const action = pendingWrite;
+      setPendingWrite(null);
+      if (action) action();
+    } catch (error) {
+      setWriteAccessError(error instanceof Error ? error.message : 'Kode akses tidak dapat diverifikasi.');
+    }
+  };
   
   // Filter state untuk print laporan
-  const [filterRange, setFilterRange] = useState('bulan_ini'); 
+  const [filterRange, setFilterRange] = useState('semua');
   const [startDate, setStartDate] = useState('');
   const [endDate, setEndDate] = useState('');
-
-  const useSupabaseAuth = Boolean(supabase && SUPABASE_AUTH_EMAIL);
-  const useLocalPasscode = Boolean(APP_PASSWORD_HASH);
 
   // Helper Toast Animasi (Pengganti alert bawaan browser)
   const showToast = (message, type = 'success') => {
@@ -168,49 +227,23 @@ function App() {
     }
   }, []);
 
-  // Cek status auth dari Supabase Auth atau passcode lokal
-  useEffect(() => {
-    let isMounted = true;
-
-    const restoreAuth = async () => {
-      if (useSupabaseAuth) {
-        const { data } = await supabase.auth.getSession();
-        if (isMounted) {
-          setIsAuthenticated(Boolean(data.session));
-        }
-        return;
-      }
-
-      const authStatus = localStorage.getItem('kod_authenticated');
-      if (isMounted && authStatus === 'true' && useLocalPasscode) {
-        setIsAuthenticated(true);
-      }
-    };
-
-    restoreAuth();
-
-    if (useSupabaseAuth) {
-      const { data: { subscription } } = supabase.auth.onAuthStateChange((_event, session) => {
-        if (isMounted) {
-          setIsAuthenticated(Boolean(session));
-        }
-      });
-
-      return () => {
-        isMounted = false;
-        subscription.unsubscribe();
-      };
-    }
-
-    return () => {
-      isMounted = false;
-    };
-  }, [useSupabaseAuth, useLocalPasscode]);
-
   // Fetch Data Toko
-  const fetchData = async () => {
+  const fetchData = async ({ showLoading = true, throwOnError = false } = {}) => {
     try {
-      setLoading(true);
+      if (showLoading) setLoading(true);
+      if (isMock) {
+        const automationResult = runDailyDemoAutomation();
+        const generatedParts = [
+          automationResult.createdCount > 0 ? `${automationResult.createdCount} penjualan` : null,
+          automationResult.purchaseCreated ? '1 pembelian stok' : null,
+          automationResult.expenseCreated ? '1 pengeluaran' : null
+        ].filter(Boolean);
+        if (generatedParts.length > 0) {
+          showToast(`Simulasi DEMO ${automationResult.dateKey}: ${generatedParts.join(', ')}.`, 'success');
+        } else if (automationResult.skippedLocations?.length > 0 || automationResult.skippedPurchase || automationResult.skippedExpense) {
+          showToast('Sebagian data simulasi DEMO tidak dibuat karena stok atau riwayat yang cocok tidak tersedia.', 'error');
+        }
+      }
       const prods = await dbService.getProducts();
       const txs = await dbService.getTransactions();
       const pur = await dbService.getPurchases();
@@ -223,17 +256,16 @@ function App() {
     } catch (err) {
       console.error(err);
       showToast('Gagal mengambil data dari database.', 'error');
+      if (throwOnError) throw err;
     } finally {
-      setLoading(false);
+      if (showLoading) setLoading(false);
     }
   };
 
-  // Hanya ambil data jika sudah login
+  // Ambil data saat aplikasi dibuka.
   useEffect(() => {
-    if (isAuthenticated) {
-      fetchData();
-    }
-  }, [isAuthenticated]);
+    fetchData();
+  }, []);
 
   // Theme Toggle - simpan ke localStorage agar persisten
   const toggleTheme = () => {
@@ -249,75 +281,6 @@ function App() {
     document.documentElement.setAttribute('data-theme', savedTheme);
   }, []);
 
-  // Login Handle
-  const handleLogin = async (e) => {
-    e.preventDefault();
-
-    if (isCloud && !useSupabaseAuth) {
-      setPasscodeError(true);
-      setPasscode('');
-      showToast('Cloud aktif, tapi email login Supabase belum dikonfigurasi.', 'error');
-      return;
-    }
-
-    if (!useSupabaseAuth && !useLocalPasscode) {
-      setPasscodeError(true);
-      setPasscode('');
-      showToast('Sandi belum dikonfigurasi di file .env.', 'error');
-      return;
-    }
-
-    try {
-      if (useSupabaseAuth) {
-        const { error } = await supabase.auth.signInWithPassword({
-          email: SUPABASE_AUTH_EMAIL,
-          password: passcode
-        });
-
-        if (error) {
-          throw error;
-        }
-
-        localStorage.removeItem('kod_authenticated');
-      } else {
-        const attemptedHash = await hashPasscode(passcode);
-
-        if (attemptedHash !== APP_PASSWORD_HASH) {
-          throw new Error('Invalid passcode');
-        }
-
-        localStorage.setItem('kod_authenticated', 'true');
-      }
-
-      setIsAuthenticated(true);
-      setPasscodeError(false);
-      setPasscode('');
-      showToast('Masuk aplikasi berhasil!', 'success');
-    } catch {
-      setPasscodeError(true);
-      setPasscode('');
-      showToast('Sandi pengaman salah!', 'error');
-    }
-  };
-
-  // Logout Handle
-  const handleLogout = () => {
-    showConfirm('Apakah Anda yakin ingin keluar dari aplikasi?', async () => {
-      if (useSupabaseAuth) {
-        const { error } = await supabase.auth.signOut();
-        if (error) {
-          showToast('Gagal keluar dari Supabase Auth.', 'error');
-          return;
-        }
-      }
-
-      localStorage.removeItem('kod_authenticated');
-      setIsAuthenticated(false);
-      setPasscode('');
-      showToast('Anda telah keluar dari sistem.', 'success');
-    });
-  };
-
   // Helper Format Rupiah
   const formatRupiah = (val) => {
     return new Intl.NumberFormat('id-ID', {
@@ -327,8 +290,12 @@ function App() {
     }).format(val);
   };
 
-  // Fungsi Trigger Cetak Printer Thermal 58mm
+  // Cetak struk thermal atau laporan A4 melalui dialog print browser.
   const handleTriggerPrint = (type) => {
+    document.body.dataset.printType = type;
+    window.addEventListener('afterprint', () => {
+      delete document.body.dataset.printType;
+    }, { once: true });
     setPrintType(type);
     setTimeout(() => {
       window.print();
@@ -373,7 +340,7 @@ function App() {
     });
 
     const fPur = purchases.filter(p => {
-      const pDate = new Date(p.tanggal);
+      const pDate = new Date(p.status === 'Lunas' ? p.tanggal_pelunasan || p.tanggal : p.tanggal);
       if (filterRange === 'hari_ini') return pDate >= today;
       if (filterRange === '7_hari') return pDate >= new Date(today.getTime() - 7 * 24 * 60 * 60 * 1000);
       if (filterRange === 'bulan_ini') return pDate.getMonth() === now.getMonth() && pDate.getFullYear() === now.getFullYear();
@@ -390,7 +357,7 @@ function App() {
 
     const omset = fTx.reduce((sum, t) => sum + Number(t.total_harga), 0);
     
-    // Pengeluaran Riil = Nyambut Barang yang statusnya Lunas (Uang keluar) + Biaya operasional harian
+    // Pengeluaran riil = pembelian berstatus lunas + biaya operasional harian.
     const beliBarang = fPur.filter(p => p.status === 'Lunas').reduce((sum, p) => sum + Number(p.total_nota), 0);
     const biayaOperasional = fExp.reduce((sum, e) => sum + Number(e.jumlah), 0);
     const totalPengeluaran = beliBarang + biayaOperasional;
@@ -402,6 +369,9 @@ function App() {
     const hutang = purchases.filter(p => p.status === 'Tempo').reduce((sum, p) => sum + Number(p.total_nota), 0);
 
     return {
+      transactions: fTx,
+      purchases: fPur,
+      expenses: fExp,
       omset,
       beliBarang,
       biayaOperasional,
@@ -409,66 +379,12 @@ function App() {
       labaBersih,
       piutang,
       hutang,
-      rangeText: filterRange === 'hari_ini' ? 'HARI INI' : filterRange === '7_hari' ? '7 HARI TERAKHIR' : filterRange === 'bulan_ini' ? 'BULAN INI' : filterRange === 'custom' ? `PERIODE ${startDate} s/d ${endDate}` : 'SEMUA PERIODE'
+      rangeText: filterRange === 'hari_ini' ? 'HARI INI' : filterRange === '7_hari' ? '7 HARI TERAKHIR' : filterRange === 'bulan_ini' ? 'BULAN INI' : filterRange === 'custom' ? `PERIODE ${startDate ? new Date(`${startDate}T00:00:00`).toLocaleDateString('id-ID', { dateStyle: 'long' }) : '...'} s/d ${endDate ? new Date(`${endDate}T00:00:00`).toLocaleDateString('id-ID', { dateStyle: 'long' }) : '...'}` : 'SEMUA PERIODE'
     };
   };
 
   const reportData = getFilteredReportData();
 
-  // -------------------------------------------------------------------------
-  // 1. TAMPILAN LOCKSCREEN JIKA BELUM LOGIN
-  // -------------------------------------------------------------------------
-  if (!isAuthenticated) {
-    return (
-      <div className="lockscreen-container">
-        {toast.show && (
-          <div className={`toast-notification toast-${toast.type}`}>
-            <div className="toast-content">
-              <span className="toast-icon">
-                {toast.type === 'success' ? <CheckCircle size={20} /> : <AlertTriangle size={20} />}
-              </span>
-              <span className="toast-message">{toast.message}</span>
-            </div>
-          </div>
-        )}
-        <div className="lockscreen-card">
-          <div className="lockscreen-icon-wrapper" style={{ backgroundColor: 'transparent', width: '90px', height: '90px', boxShadow: 'none', overflow: 'hidden', borderRadius: '16px' }}>
-            <img src={logoImg} alt="Logo Kodri Elektronik" style={{ width: '100%', height: '100%', objectFit: 'cover' }} />
-          </div>
-          <h2>Kodri Elektronik</h2>
-          <p>Masukkan sandi/PIN pengaman untuk mengakses dashboard & kasir toko.</p>
-          
-          <form onSubmit={handleLogin} className="lockscreen-form">
-            <input 
-              type="password" 
-              placeholder="••••••••" 
-              className="lockscreen-input"
-              value={passcode}
-              onChange={(e) => {
-                setPasscode(e.target.value);
-                setPasscodeError(false);
-              }}
-              required
-              autoFocus
-            />
-            {passcodeError && (
-              <div className="lockscreen-error">PIN/Sandi salah! Silakan coba lagi.</div>
-            )}
-            <button type="submit" className="lockscreen-btn">
-              Masuk Aplikasi
-            </button>
-          </form>
-          <div style={{ marginTop: '24px', fontSize: '0.8rem', color: 'var(--text-muted)' }}>
-            Lupa sandi? tanya anak mu ilhamdho
-          </div>
-        </div>
-      </div>
-    );
-  }
-
-  // -------------------------------------------------------------------------
-  // 2. TAMPILAN APLIKASI UTAMA (SETELAH BERHASIL LOGIN)
-  // -------------------------------------------------------------------------
   return (
     <div className="app-container">
       {/* Toast Notification Animasi */}
@@ -484,7 +400,7 @@ function App() {
       )}
 
       {/* Mobile Top Bar */}
-      <div className="mobile-top-bar no-print" style={{ display: 'flex', alignItems: 'center' }}>
+      <div className="mobile-top-bar no-print" style={{ alignItems: 'center' }}>
         <div style={{ display: 'flex', alignItems: 'center' }}>
           <img src={logoImg} alt="Logo" style={{ width: '28px', height: '28px', borderRadius: '6px', marginRight: '8px' }} />
           <span className="mobile-title">Kodri Elektronik</span>
@@ -492,9 +408,6 @@ function App() {
         <div style={{ display: 'flex', gap: '4px' }}>
           <button className="btn-icon-only" onClick={toggleTheme} aria-label="Toggle Theme">
             {theme === 'light' ? <Moon size={18} /> : <Sun size={18} />}
-          </button>
-          <button className="btn-icon-only" style={{ color: 'var(--color-danger)' }} onClick={handleLogout} aria-label="Keluar">
-            <LogOut size={18} />
           </button>
         </div>
       </div>
@@ -525,14 +438,7 @@ function App() {
             onClick={() => setActiveTab('produk')}
           >
             <Package size={20} />
-            Stok & Barang
-          </button>
-          <button 
-            className={`menu-item ${activeTab === 'kulakan' ? 'active' : ''}`}
-            onClick={() => setActiveTab('kulakan')}
-          >
-            <ShoppingBag size={20} />
-            Nyambut Barang (Nota)
+            Stok & Pembelian
           </button>
           <button 
             className={`menu-item ${activeTab === 'pengeluaran' ? 'active' : ''}`}
@@ -551,13 +457,6 @@ function App() {
               <button className="btn-icon-only" onClick={toggleTheme} aria-label="Toggle Theme">
                 {theme === 'light' ? <Moon size={18} /> : <Sun size={18} />}
               </button>
-              <button 
-                className="btn btn-secondary btn-sm" 
-                style={{ padding: '4px 8px', fontSize: '0.75rem', display: 'inline-flex', alignItems: 'center', gap: '4px', borderColor: 'rgba(239, 68, 68, 0.3)', color: 'var(--color-danger)' }} 
-                onClick={handleLogout}
-              >
-                <LogOut size={12} /> Keluar
-              </button>
             </div>
           </div>
         </div>
@@ -571,15 +470,13 @@ function App() {
             <h1>
               {activeTab === 'dashboard' && 'Dashboard Keuangan'}
               {activeTab === 'pos' && 'Menu Kasir (Penjualan)'}
-              {activeTab === 'produk' && 'Katalog Stok Barang'}
-              {activeTab === 'kulakan' && 'Nyambut Barang (Input Nota)'}
+              {activeTab === 'produk' && 'Stok & Pembelian Barang'}
               {activeTab === 'pengeluaran' && 'Biaya Operasional Toko'}
             </h1>
             <p>
               {activeTab === 'dashboard' && 'Pantau keuntungan, pengeluaran, hutang supplier, tempo pelanggan, dan grafik penjualan'}
-              {activeTab === 'pos' && 'Pencatatan penjualan cepat oleh Ayah (di Pasar) atau Ibu (di Rumah)'}
-              {activeTab === 'produk' && 'Kelola daftar harga dan batas minimum stok barang tanpa repot'}
-              {activeTab === 'kulakan' && 'Input nota beli dari toko grosir besar untuk restock barang masuk (Nyambut Barang)'}
+              {activeTab === 'pos' && 'Pencatatan penjualan cepat berdasarkan lokasi toko'}
+              {activeTab === 'produk' && 'Catat transaksi pembelian, lalu distribusikan stok yang diterima ke Rumah dan Pasar'}
               {activeTab === 'pengeluaran' && 'Catat pengeluaran harian seperti bensin, makan, iuran, dll.'}
             </p>
           </div>
@@ -596,7 +493,7 @@ function App() {
           <div className="alert-banner alert-info-banner no-print">
             <Database size={18} />
             <div>
-              <strong>Petunjuk untuk Anda:</strong> Aplikasi ini berjalan dengan penyimpanan lokal sementara. Agar Ayah di Pasar dan Ibu di Rumah bisa saling sinkronisasi stok secara real-time, buat file <code>.env</code> di root folder dan masukkan API keys dari akun Supabase gratis Anda.
+              <strong>Mode demo:</strong> Data hanya tersimpan di browser ini. Hubungkan Supabase melalui file <code>.env</code> untuk sinkronisasi antar perangkat.
             </div>
           </div>
         )}
@@ -614,8 +511,10 @@ function App() {
                 transactions={transactions} 
                 purchases={purchases}
                 expenses={expenses} 
-                formatRupiah={formatRupiah} 
                 fetchData={fetchData}
+                showToast={showToast}
+                showConfirm={showConfirm}
+                formatRupiah={formatRupiah}
                 filterRange={filterRange}
                 setFilterRange={setFilterRange}
                 startDate={startDate}
@@ -623,8 +522,7 @@ function App() {
                 endDate={endDate}
                 setEndDate={setEndDate}
                 handleTriggerPrint={handleTriggerPrint}
-                showToast={showToast}
-                showConfirm={showConfirm}
+                requestWriteAccess={requestWriteAccess}
               />
             )}
             {activeTab === 'pos' && (
@@ -636,25 +534,20 @@ function App() {
                 setLastTxData={setLastTxData}
                 handleTriggerPrint={handleTriggerPrint}
                 showToast={showToast}
+                requestWriteAccess={requestWriteAccess}
               />
             )}
             {activeTab === 'produk' && (
-              <ProductsView 
-                products={products} 
-                formatRupiah={formatRupiah} 
-                fetchData={fetchData}
-                showToast={showToast}
-                showConfirm={showConfirm}
-              />
-            )}
-            {activeTab === 'kulakan' && (
-              <PurchasesView 
+              <InventoryView
                 products={products} 
                 purchases={purchases}
                 formatRupiah={formatRupiah} 
                 fetchData={fetchData}
-                setActiveTab={setActiveTab}
                 showToast={showToast}
+                showConfirm={showConfirm}
+                handleTriggerPrint={handleTriggerPrint}
+                setPrintProducts={setPrintProducts}
+                requestWriteAccess={requestWriteAccess}
               />
             )}
             {activeTab === 'pengeluaran' && (
@@ -664,16 +557,15 @@ function App() {
                 fetchData={fetchData}
                 showToast={showToast}
                 showConfirm={showConfirm}
+                requestWriteAccess={requestWriteAccess}
               />
             )}
           </>
         )}
       </main>
 
-      {/* =========================================================================
-          STRUK CETAK THERMAL 58mm (Hanya Muncul Saat Proses Print Browser)
-          ========================================================================= */}
-      <div className="print-only receipt-container">
+      {/* Struk thermal untuk transaksi kasir */}
+      {printType === 'receipt' && <div className="print-only receipt-container">
         <div className="receipt-header">
           <div className="receipt-title">KODRI ELEKTRONIK</div>
           <div style={{ fontSize: '7pt' }}>Pasar & Rumah Sedia Alat Listrik</div>
@@ -686,8 +578,7 @@ function App() {
         
         <div className="receipt-divider"></div>
 
-        {printType === 'receipt' && lastTxData ? (
-          /* TAMPILAN PRINT STRUK BELANJA KASIR */
+        {lastTxData && (
           <>
             <div style={{ fontSize: '7.5pt', marginBottom: '4px' }}>
               <div className="receipt-row"><span>Lokasi:</span><span>{lastTxData.lokasi_penjualan}</span></div>
@@ -726,81 +617,202 @@ function App() {
               Terima Kasih Atas Kunjungan Anda!<br/>Barang yang sudah dibeli tidak dapat ditukar.
             </div>
           </>
-        ) : (
-          /* TAMPILAN PRINT REKAP LAPORAN KEUANGAN HARI INI / BULANAN (Z-REPORT) */
-          <>
-            <div style={{ textAlign: 'center', fontWeight: 'bold', fontSize: '8.5pt', marginBottom: '6px' }}>
-              REKAP LAPORAN KEUANGAN<br/>({reportData.rangeText})
-            </div>
-            
-            <div className="receipt-divider"></div>
-            
-            <div style={{ fontSize: '8pt' }}>
-              <div className="receipt-row">
-                <span>Pemasukan (Omset):</span>
-                <span>{formatRupiah(reportData.omset)}</span>
-              </div>
-              <div className="receipt-row" style={{ color: '#555' }}>
-                <span>Beli Barang (Nota):</span>
-                <span>- {formatRupiah(reportData.beliBarang)}</span>
-              </div>
-              <div className="receipt-row" style={{ color: '#555' }}>
-                <span>Biaya Operasional:</span>
-                <span>- {formatRupiah(reportData.biayaOperasional)}</span>
-              </div>
-              <div className="receipt-row" style={{ fontWeight: 'bold' }}>
-                <span>Total Pengeluaran:</span>
-                <span>- {formatRupiah(reportData.totalPengeluaran)}</span>
-              </div>
-              
-              <div className="receipt-divider"></div>
-              
-              <div className="receipt-row total" style={{ fontSize: '9.5pt' }}>
-                <span>LABA/RUGI BERSIH:</span>
-                <span style={{ color: reportData.labaBersih >= 0 ? 'green' : 'red' }}>
-                  {formatRupiah(reportData.labaBersih)}
-                </span>
-              </div>
-              
-              <div className="receipt-divider"></div>
-              
-              <div className="receipt-row" style={{ fontWeight: 'bold' }}>
-                <span>Hutang ke Supplier:</span>
-                <span style={{ color: 'red' }}>{formatRupiah(reportData.hutang)}</span>
-              </div>
-              <div className="receipt-row" style={{ fontWeight: 'bold' }}>
-                <span>Piutang Pelanggan:</span>
-                <span style={{ color: 'orange' }}>{formatRupiah(reportData.piutang)}</span>
-              </div>
-            </div>
-            
-            <div className="receipt-divider"></div>
-            
-            <div style={{ fontSize: '7.5pt' }}>
-              <div style={{ fontWeight: 'bold', marginBottom: '2px' }}>Daftar Stok Menipis:</div>
-              {products.filter(p => p.stok_rumah < p.stok_minimum || p.stok_pasar < p.stok_minimum).slice(0, 8).map((p, idx) => (
-                <div key={idx} className="receipt-row" style={{ fontSize: '7pt' }}>
-                  <span>- {p.nama.substring(0, 16)}..</span>
-                  <span>R:{p.stok_rumah} | P:{p.stok_pasar}</span>
-                </div>
-              ))}
-              {products.filter(p => p.stok_rumah < p.stok_minimum || p.stok_pasar < p.stok_minimum).length === 0 && (
-                <div style={{ fontSize: '7pt', fontStyle: 'italic', textAlign: 'center' }}>Semua stok aman.</div>
-              )}
-            </div>
-
-            <div className="receipt-divider" style={{ marginTop: '12px' }}></div>
-            <div style={{ textAlign: 'center', fontSize: '7pt', marginTop: '4px' }}>
-              Kodri Elektronik - Laporan Sistem
-            </div>
-          </>
         )}
-      </div>
+      </div>}
+
+      {printType === 'report' && (
+        <section className="print-only financial-report-print">
+          <header className="financial-report-header">
+            <img src={logoImg} alt="Logo Kodri Elektronik" />
+            <div>
+              <h1>KODRI ELEKTRONIK</h1>
+              <p>Pasar &amp; Rumah Sedia Alat Listrik</p>
+              <p>LAPORAN KEUANGAN · {reportData.rangeText}</p>
+            </div>
+          </header>
+          <div className="financial-report-meta">
+            <span>Dicetak: {new Date().toLocaleString('id-ID', { dateStyle: 'long', timeStyle: 'short' })}</span>
+            <span>Periode laporan: {reportData.rangeText}</span>
+          </div>
+
+          <h2>Ringkasan Keuangan</h2>
+          <table className="financial-report-table summary">
+            <tbody>
+              <tr><th>Penjualan / Omset</th><td>{formatRupiah(reportData.omset)}</td></tr>
+              <tr><th>Pembelian barang yang dibayar</th><td>({formatRupiah(reportData.beliBarang)})</td></tr>
+              <tr><th>Biaya operasional</th><td>({formatRupiah(reportData.biayaOperasional)})</td></tr>
+              <tr className="financial-report-total"><th>Surplus / Defisit arus kas periode ini</th><td>{formatRupiah(reportData.labaBersih)}</td></tr>
+            </tbody>
+          </table>
+          <p className="financial-report-note">Ringkasan ini menggunakan pencatatan arus kas sederhana: penjualan dikurangi pembelian yang sudah dibayar dan biaya operasional. Pembelian berstatus Tempo tercantum di tabel, tetapi belum dihitung sebagai arus kas keluar. Ini bukan laporan laba-rugi akuntansi berbasis HPP.</p>
+
+          <h2>Penjualan</h2>
+          <table className="financial-report-table">
+            <thead><tr><th>#</th><th>Tanggal</th><th>Pelanggan</th><th>Lokasi</th><th>Pembayaran</th><th className="amount">Total</th></tr></thead>
+            <tbody>
+              {reportData.transactions.map((transaction, index) => (
+                <tr key={transaction.id}>
+                  <td>{index + 1}</td>
+                  <td>{new Date(transaction.tanggal).toLocaleString('id-ID', { dateStyle: 'medium', timeStyle: 'short' })}</td>
+                  <td>
+                    {transaction.nama_pelanggan || 'Umum'}
+                    {transaction.sumber_data === 'Simulasi otomatis (DEMO)' && <small>DEMO</small>}
+                    {transaction.items?.length ? <small>{transaction.items.map((item) => `${item.nama_produk} (${item.jumlah})`).join(', ')}</small> : null}
+                  </td>
+                  <td>{transaction.lokasi_penjualan}</td>
+                  <td>{transaction.metode_pembayaran} · {transaction.status_pembayaran}</td>
+                  <td className="amount">{formatRupiah(transaction.total_harga)}</td>
+                </tr>
+              ))}
+              {reportData.transactions.length === 0 && <tr><td colSpan="6" className="empty">Tidak ada transaksi penjualan pada periode ini.</td></tr>}
+            </tbody>
+            <tfoot><tr><th colSpan="5">Total penjualan</th><th className="amount">{formatRupiah(reportData.omset)}</th></tr></tfoot>
+          </table>
+
+          <h2>Pembelian Barang</h2>
+          <table className="financial-report-table">
+            <thead><tr><th>#</th><th>Tanggal transaksi / pelunasan</th><th>Supplier</th><th>Status</th><th>Barang</th><th className="amount">Nilai nota</th></tr></thead>
+            <tbody>
+              {reportData.purchases.map((purchase, index) => (
+                <tr key={purchase.id}>
+                  <td>{index + 1}</td>
+                  <td>{new Date(purchase.status === 'Lunas' ? purchase.tanggal_pelunasan || purchase.tanggal : purchase.tanggal).toLocaleDateString('id-ID', { dateStyle: 'medium' })}</td>
+                  <td>{purchase.nama_supplier}{purchase.sumber_data === 'Simulasi otomatis (DEMO)' ? ' · DEMO' : ''}</td>
+                  <td>{purchase.status === 'Lunas' ? `Lunas${purchase.tanggal_pelunasan ? ` · ${new Date(purchase.tanggal_pelunasan).toLocaleDateString('id-ID')}` : ''}` : 'Tempo / belum dibayar'}</td>
+                  <td>{purchase.items?.map((item) => `${item.nama_produk} (${item.jumlah})`).join(', ') || '-'}</td>
+                  <td className="amount">{formatRupiah(purchase.total_nota)}</td>
+                </tr>
+              ))}
+              {reportData.purchases.length === 0 && <tr><td colSpan="6" className="empty">Tidak ada pembelian pada periode ini.</td></tr>}
+            </tbody>
+            <tfoot><tr><th colSpan="5">Pembelian dibayar pada periode ini</th><th className="amount">{formatRupiah(reportData.beliBarang)}</th></tr></tfoot>
+          </table>
+
+          <h2>Biaya Operasional</h2>
+          <table className="financial-report-table">
+            <thead><tr><th>#</th><th>Tanggal</th><th>Kategori</th><th>Keterangan</th><th className="amount">Jumlah</th></tr></thead>
+            <tbody>
+              {reportData.expenses.map((expense, index) => (
+                <tr key={expense.id}>
+                  <td>{index + 1}</td>
+                  <td>{new Date(expense.tanggal).toLocaleDateString('id-ID', { dateStyle: 'medium' })}</td>
+                  <td>{expense.kategori}</td>
+                  <td>{expense.keterangan || '-'}{expense.sumber_data === 'Simulasi otomatis (DEMO)' ? ' · DEMO' : ''}</td>
+                  <td className="amount">{formatRupiah(expense.jumlah)}</td>
+                </tr>
+              ))}
+              {reportData.expenses.length === 0 && <tr><td colSpan="5" className="empty">Tidak ada biaya operasional pada periode ini.</td></tr>}
+            </tbody>
+            <tfoot><tr><th colSpan="4">Total biaya operasional</th><th className="amount">{formatRupiah(reportData.biayaOperasional)}</th></tr></tfoot>
+          </table>
+
+          <div className="financial-report-balances">
+            <strong>Posisi saat laporan dicetak:</strong>
+            <span>Piutang pelanggan belum lunas: {formatRupiah(reportData.piutang)}</span>
+            <span>Hutang supplier belum lunas: {formatRupiah(reportData.hutang)}</span>
+          </div>
+
+          <footer className="financial-report-signatures">
+            <div><span>Disusun oleh,</span><strong>Admin / Kasir</strong><i></i><span>Nama &amp; tanda tangan</span></div>
+            <div><span>Mengetahui,</span><strong>Pemilik Toko</strong><i></i><span>Nama &amp; tanda tangan</span></div>
+          </footer>
+          <div className="financial-report-footer">Laporan dicetak dari sistem Kodri Elektronik · {new Date().toLocaleDateString('id-ID')}</div>
+        </section>
+      )}
+
+      {(printType === 'stock' || printType === 'stocktake') && (
+        <section className="print-only inventory-report-print">
+          <header className="financial-report-header">
+            <img src={logoImg} alt="Logo Kodri Elektronik" />
+            <div>
+              <h1>KODRI ELEKTRONIK</h1>
+              <p>Pasar &amp; Rumah Sedia Alat Listrik</p>
+              <p>{printType === 'stock' ? 'LAPORAN POSISI STOK' : 'LEMBAR STOK OPNAME'}</p>
+            </div>
+          </header>
+          <div className="financial-report-meta">
+            <span>Dicetak: {new Date().toLocaleString('id-ID', { dateStyle: 'long', timeStyle: 'short' })}</span>
+            <span>Total jenis barang: {printProducts.length}</span>
+          </div>
+          <p className="inventory-report-instructions">
+            {printType === 'stock'
+              ? 'Ringkasan jumlah barang di seluruh lokasi berdasarkan catatan sistem saat laporan dicetak. Daftar mengikuti filter katalog yang sedang dipilih.'
+              : 'Isi jumlah fisik yang dihitung di lapangan. Catat selisih dan keterangan untuk ditindaklanjuti.'}
+          </p>
+          <table className={`financial-report-table inventory-report-table ${printType === 'stocktake' ? 'stocktake' : ''}`}>
+            <thead>
+              <tr>
+                <th>#</th>
+                <th>Nama Barang</th>
+                <th>Kategori</th>
+                <th>Rumah</th>
+                <th>Pasar</th>
+                <th>Belum Dialokasikan</th>
+                <th>Total Sistem</th>
+                {printType === 'stocktake' && <><th>Hitung Fisik</th><th>Selisih</th><th>Catatan</th></>}
+                {printType === 'stock' && <th>Status</th>}
+              </tr>
+            </thead>
+            <tbody>
+              {printProducts.map((product, index) => {
+                const rumah = Number(product.stok_rumah) || 0;
+                const pasar = Number(product.stok_pasar) || 0;
+                const pending = Number(product.stok_belum_dialokasikan) || 0;
+                const total = rumah + pasar + pending;
+                const lowLocations = [
+                  rumah < Number(product.stok_minimum) ? 'Rumah' : null,
+                  pasar < Number(product.stok_minimum) ? 'Pasar' : null
+                ].filter(Boolean);
+                return (
+                  <tr key={product.id}>
+                    <td>{index + 1}</td>
+                    <td>{product.nama}</td>
+                    <td>{product.kategori}</td>
+                    <td className="inventory-number">{rumah}</td>
+                    <td className="inventory-number">{pasar}</td>
+                    <td className="inventory-number">{pending}</td>
+                    <td className="inventory-number"><strong>{total}</strong></td>
+                    {printType === 'stocktake' ? (
+                      <>
+                        <td><span className="inventory-write-space"></span></td>
+                        <td><span className="inventory-write-space"></span></td>
+                        <td><span className="inventory-write-space"></span></td>
+                      </>
+                    ) : (
+                      <td>{lowLocations.length ? `Stok rendah: ${lowLocations.join(', ')}` : pending ? 'Perlu dialokasikan' : 'Aman'}</td>
+                    )}
+                  </tr>
+                );
+              })}
+              {printProducts.length === 0 && <tr><td colSpan={printType === 'stocktake' ? 10 : 8} className="empty">Tidak ada produk sesuai filter.</td></tr>}
+            </tbody>
+            <tfoot>
+              <tr>
+                <th colSpan="3">Total unit</th>
+                <th className="inventory-number">{printProducts.reduce((sum, product) => sum + (Number(product.stok_rumah) || 0), 0)}</th>
+                <th className="inventory-number">{printProducts.reduce((sum, product) => sum + (Number(product.stok_pasar) || 0), 0)}</th>
+                <th className="inventory-number">{printProducts.reduce((sum, product) => sum + (Number(product.stok_belum_dialokasikan) || 0), 0)}</th>
+                <th className="inventory-number">{printProducts.reduce((sum, product) => sum + (Number(product.stok_rumah) || 0) + (Number(product.stok_pasar) || 0) + (Number(product.stok_belum_dialokasikan) || 0), 0)}</th>
+                {printType === 'stocktake' && <th colSpan="3"></th>}
+                {printType === 'stock' && <th></th>}
+              </tr>
+            </tfoot>
+          </table>
+          {printType === 'stocktake' && (
+            <footer className="financial-report-signatures inventory-report-signatures">
+              <div><span>Dihitung oleh,</span><strong>Admin</strong><i></i><span>Nama &amp; tanda tangan</span></div>
+              <div><span>Disetujui oleh,</span><strong>Pemilik</strong><i></i><span>Nama &amp; tanda tangan</span></div>
+            </footer>
+          )}
+          <div className="financial-report-footer">Laporan dicetak dari sistem Kodri Elektronik · {new Date().toLocaleDateString('id-ID')}</div>
+        </section>
+      )}
 
       {/* Mobile Bottom Navigation */}
       <nav className="mobile-nav no-print">
         <button 
           className={`mobile-nav-item ${activeTab === 'dashboard' ? 'active' : ''}`}
+          aria-current={activeTab === 'dashboard' ? 'page' : undefined}
           onClick={() => setActiveTab('dashboard')}
         >
           <LayoutDashboard />
@@ -808,6 +820,7 @@ function App() {
         </button>
         <button 
           className={`mobile-nav-item ${activeTab === 'pos' ? 'active' : ''}`}
+          aria-current={activeTab === 'pos' ? 'page' : undefined}
           onClick={() => setActiveTab('pos')}
         >
           <ShoppingCart />
@@ -815,20 +828,15 @@ function App() {
         </button>
         <button 
           className={`mobile-nav-item ${activeTab === 'produk' ? 'active' : ''}`}
+          aria-current={activeTab === 'produk' ? 'page' : undefined}
           onClick={() => setActiveTab('produk')}
         >
           <Package />
-          <span>Stok</span>
-        </button>
-        <button 
-          className={`mobile-nav-item ${activeTab === 'kulakan' ? 'active' : ''}`}
-          onClick={() => setActiveTab('kulakan')}
-        >
-          <ShoppingBag />
-          <span>Nyambut</span>
+          <span>Stok & Beli</span>
         </button>
         <button 
           className={`mobile-nav-item ${activeTab === 'pengeluaran' ? 'active' : ''}`}
+          aria-current={activeTab === 'pengeluaran' ? 'page' : undefined}
           onClick={() => setActiveTab('pengeluaran')}
         >
           <TrendingDown />
@@ -836,6 +844,38 @@ function App() {
         </button>
       </nav>
       {/* MODAL KONFIRMASI CUSTOM TERANIMASI (YES/NO DIALOG) */}
+      {writeAccessModal && (
+        <div className="modal-overlay" onClick={() => { setWriteAccessModal(false); setPendingWrite(null); }}>
+          <form className="modal-container" onSubmit={handleWriteAccessSubmit} onClick={(event) => event.stopPropagation()} style={{ maxWidth: '400px', width: '90%' }}>
+            <div className="modal-header">
+              <span className="modal-title">Kode Akses untuk Mengubah Data</span>
+              <button type="button" className="btn-icon-only btn-sm" aria-label="Tutup" onClick={() => { setWriteAccessModal(false); setPendingWrite(null); }}>X</button>
+            </div>
+            <div className="modal-body">
+              <p style={{ marginBottom: '14px', color: 'var(--text-muted)', fontSize: '0.9rem' }}>
+                Isi kode akses untuk melanjutkan perubahan data. Akses edit aktif selama 8 jam atau sampai tab browser ditutup.
+              </p>
+              <label htmlFor="write-access-code">Kode akses</label>
+              <input
+                autoFocus
+                id="write-access-code"
+                type="password"
+                autoComplete="current-password"
+                className="form-control"
+                value={writeAccessCode}
+                onChange={(event) => setWriteAccessCode(event.target.value)}
+                aria-describedby="write-access-error"
+              />
+              {writeAccessError && <p id="write-access-error" role="alert" style={{ marginTop: '10px', color: 'var(--color-danger)', fontSize: '0.85rem' }}>{writeAccessError}</p>}
+            </div>
+            <div className="modal-footer">
+              <button type="button" className="btn btn-secondary" onClick={() => { setWriteAccessModal(false); setPendingWrite(null); }}>Batal</button>
+              <button type="submit" className="btn btn-primary">Lanjutkan</button>
+            </div>
+          </form>
+        </div>
+      )}
+
       {confirmModal.show && (
         <div className="modal-overlay confirm-overlay" onClick={confirmModal.onCancel}>
           <div className="modal-container confirm-container" onClick={(e) => e.stopPropagation()} style={{ maxWidth: '400px', width: '90%', borderRadius: '12px' }}>
@@ -876,7 +916,7 @@ function App() {
 // ----------------------------------------------------------------------------------
 // SUB-VIEW: DASHBOARD
 // ----------------------------------------------------------------------------------
-function DashboardView({ products, transactions, purchases, expenses, formatRupiah, fetchData, filterRange, setFilterRange, startDate, setStartDate, endDate, setEndDate, handleTriggerPrint, showToast, showConfirm }) {
+function DashboardView({ products, transactions, purchases, expenses, formatRupiah, fetchData, filterRange, setFilterRange, startDate, setStartDate, endDate, setEndDate, handleTriggerPrint, showToast, showConfirm, requestWriteAccess }) {
   const [updatingTxId, setUpdatingTxId] = useState(null);
   const [updatingPurId, setUpdatingPurId] = useState(null);
   const [activePreviewImg, setActivePreviewImg] = useState(null);
@@ -888,12 +928,12 @@ function DashboardView({ products, transactions, purchases, expenses, formatRupi
   const [showLaba, setShowLaba] = useState(true);
 
   // Filter items sesuai rentang waktu
-  const filterByDate = (items, dateField) => {
+  const filterByDate = (items, dateField, getDate = (item) => item[dateField]) => {
     const now = new Date();
     const today = new Date(now.getFullYear(), now.getMonth(), now.getDate());
     
     return items.filter(item => {
-      const itemDate = new Date(item[dateField]);
+      const itemDate = new Date(getDate(item));
       if (filterRange === 'hari_ini') {
         return itemDate >= today;
       } else if (filterRange === '7_hari') {
@@ -915,12 +955,16 @@ function DashboardView({ products, transactions, purchases, expenses, formatRupi
 
   const filteredTx = filterByDate(transactions, 'tanggal');
   const filteredExp = filterByDate(expenses, 'tanggal');
-  const filteredPur = filterByDate(purchases, 'tanggal');
+  const filteredPur = filterByDate(
+    purchases,
+    'tanggal',
+    (purchase) => purchase.status === 'Lunas' ? purchase.tanggal_pelunasan || purchase.tanggal : purchase.tanggal
+  );
 
   // Keuangan Metrics (MODEL ARUS KAS SEDERHANA / CASH FLOW)
   const totalOmset = filteredTx.reduce((sum, t) => sum + Number(t.total_harga), 0);
   
-  // Pengeluaran 1: Belanja Barang / Nota Nyambut Barang yang dibayar lunas
+  // Pengeluaran 1: Pembelian barang yang sudah dibayar
   const totalBeliBarang = filteredPur.filter(p => p.status === 'Lunas').reduce((sum, p) => sum + Number(p.total_nota), 0);
   
   // Pengeluaran 2: Operasional Harian (bensin, makan, iuran)
@@ -936,7 +980,7 @@ function DashboardView({ products, transactions, purchases, expenses, formatRupi
   const tempoTxs = transactions.filter(t => t.metode_pembayaran === 'Tempo' && t.status_pembayaran === 'Belum Lunas');
   const totalPiutang = tempoTxs.reduce((sum, t) => sum + Number(t.total_harga), 0);
 
-  // HUTANG (Nyambut Barang Tempo Belum Lunas ke Supplier)
+  // HUTANG pembelian tempo yang belum lunas ke supplier.
   const tempoPurchases = purchases.filter(p => p.status === 'Tempo');
   const totalHutang = tempoPurchases.reduce((sum, p) => sum + Number(p.total_nota), 0);
 
@@ -944,31 +988,35 @@ function DashboardView({ products, transactions, purchases, expenses, formatRupi
   const lowStockProducts = products.filter(p => p.stok_rumah < p.stok_minimum || p.stok_pasar < p.stok_minimum);
 
   // Tulis status lunas untuk Piutang Pelanggan
-  const handleMarkTxAsLunas = async (id) => {
-    try {
-      setUpdatingTxId(id);
-      await dbService.updateTransactionStatus(id, 'Lunas');
-      showToast('Piutang pelanggan berhasil dilunasi!', 'success');
-      fetchData();
-    } catch (e) {
-      showToast('Gagal melunasi piutang.', 'error');
-    } finally {
-      setUpdatingTxId(null);
-    }
+  const handleMarkTxAsLunas = (id) => {
+    requestWriteAccess(async () => {
+      try {
+        setUpdatingTxId(id);
+        await dbService.updateTransactionStatus(id, 'Lunas');
+        showToast('Piutang pelanggan berhasil dilunasi!', 'success');
+        fetchData();
+      } catch (e) {
+        showToast('Gagal melunasi piutang.', 'error');
+      } finally {
+        setUpdatingTxId(null);
+      }
+    });
   };
 
   // Tulis status lunas untuk Hutang ke Supplier
-  const handleMarkPurchaseAsLunas = async (id) => {
-    try {
-      setUpdatingPurId(id);
-      await dbService.updatePurchaseStatus(id, 'Lunas');
-      showToast('Hutang supplier berhasil dilunasi!', 'success');
-      fetchData();
-    } catch (e) {
-      showToast('Gagal melunasi hutang.', 'error');
-    } finally {
-      setUpdatingPurId(null);
-    }
+  const handleMarkPurchaseAsLunas = (id) => {
+    requestWriteAccess(async () => {
+      try {
+        setUpdatingPurId(id);
+        await dbService.updatePurchaseStatus(id, 'Lunas');
+        showToast('Hutang supplier berhasil dilunasi!', 'success');
+        fetchData();
+      } catch (e) {
+        showToast('Gagal melunasi hutang.', 'error');
+      } finally {
+        setUpdatingPurId(null);
+      }
+    });
   };
 
   // ----------------------------------------------------
@@ -1039,7 +1087,7 @@ function DashboardView({ products, transactions, purchases, expenses, formatRupi
           return d.getMonth() === m && d.getFullYear() === y;
         });
         const purs = purchases.filter(p => {
-          const d = new Date(p.tanggal);
+          const d = new Date(p.tanggal_pelunasan || p.tanggal);
           return d.getMonth() === m && d.getFullYear() === y && p.status === 'Lunas';
         });
 
@@ -1053,7 +1101,7 @@ function DashboardView({ products, transactions, purchases, expenses, formatRupi
         
         const txs = transactions.filter(t => new Date(t.tanggal).toDateString() === dateStr);
         const exps = expenses.filter(e => new Date(e.tanggal).toDateString() === dateStr);
-        const purs = purchases.filter(p => new Date(p.tanggal).toDateString() === dateStr && p.status === 'Lunas');
+        const purs = purchases.filter(p => new Date(p.tanggal_pelunasan || p.tanggal).toDateString() === dateStr && p.status === 'Lunas');
 
         pem = txs.reduce((sum, t) => sum + Number(t.total_harga), 0);
         const bel = purs.reduce((sum, p) => sum + Number(p.total_nota), 0);
@@ -1072,6 +1120,55 @@ function DashboardView({ products, transactions, purchases, expenses, formatRupi
   };
 
   const chartData = getChartData();
+
+  const handleExportBackup = async () => {
+    try {
+      await downloadExcelBackup({ products, transactions, purchases, expenses });
+      showToast('Backup Excel berhasil diunduh.', 'success');
+    } catch (error) {
+      console.error('Gagal mengekspor backup Excel:', error);
+      showToast('Gagal mengekspor backup Excel.', 'error');
+    }
+  };
+
+  const handleRestoreBackup = async (event) => {
+    const input = event.target;
+    const file = input.files?.[0];
+    input.value = '';
+    if (!file) return;
+
+    requestWriteAccess(async () => {
+      try {
+        const backup = await parseExcelBackup(await file.arrayBuffer());
+        const recordCount = backup.products.length + backup.transactions.length + backup.purchases.length + backup.expenses.length;
+        showConfirm(
+          `PERINGATAN: Pemulihan akan mengganti seluruh data saat ini (${recordCount} data dari file Excel). Tindakan ini tidak dapat dibatalkan. Lanjutkan?`,
+          async () => {
+            const currentData = { products, transactions, purchases, expenses };
+            try {
+              await dbService.replaceAllData(backup);
+              await fetchData();
+              showToast('Database berhasil dipulihkan dari file Excel.', 'success');
+            } catch (error) {
+              console.error('Gagal memulihkan backup Excel:', error);
+              try {
+                await dbService.replaceAllData(currentData);
+                await fetchData();
+                showToast('Pemulihan gagal. Data sebelumnya berhasil dikembalikan.', 'error');
+              } catch (rollbackError) {
+                console.error('Gagal mengembalikan data sebelum pemulihan:', rollbackError);
+                await fetchData();
+                showToast('Pemulihan dan pengembalian data sebelumnya gagal. Periksa database sebelum melanjutkan.', 'error');
+              }
+            }
+          }
+        );
+      } catch (error) {
+        console.error('File backup Excel tidak dapat dibaca:', error);
+        showToast(error.message || 'File backup Excel tidak valid.', 'error');
+      }
+    });
+  };
 
   // Hitung nilai maksimum dari series yang aktif agar skala tingginya akurat dan sebanding
   const activeValues = [];
@@ -1119,7 +1216,7 @@ function DashboardView({ products, transactions, purchases, expenses, formatRupi
         </div>
         
         <button className="btn btn-secondary" onClick={() => handleTriggerPrint('report')} style={{ marginLeft: 'auto' }}>
-          <Printer size={16} /> Cetak Struk Laporan Keuangan
+          <Printer size={16} /> Cetak Laporan Keuangan (PDF)
         </button>
       </div>
 
@@ -1471,7 +1568,12 @@ function DashboardView({ products, transactions, purchases, expenses, formatRupi
                   <tbody>
                     {tempoPurchases.map(p => (
                       <tr key={p.id}>
-                        <td style={{ fontWeight: 'bold' }}>{p.nama_supplier}</td>
+                        <td style={{ fontWeight: 'bold' }}>
+                          {p.nama_supplier}
+                          {p.sumber_data === 'Simulasi otomatis (DEMO)' && (
+                            <span className="badge badge-warning" style={{ marginLeft: '6px', fontSize: '0.68rem' }}>DEMO</span>
+                          )}
+                        </td>
                         <td style={{ color: 'var(--color-danger)', fontWeight: 'bold' }}>{formatRupiah(p.total_nota)}</td>
                         <td style={{ fontSize: '0.8rem', color: 'var(--text-muted)' }}>
                           {new Date(p.tanggal).toLocaleDateString('id-ID', { day: 'numeric', month: 'short' })}
@@ -1499,80 +1601,28 @@ function DashboardView({ products, transactions, purchases, expenses, formatRupi
       {/* PANEL UTILITAS & BACKUP DATABASE */}
       <div className="panel-card no-print" style={{ marginTop: '24px' }}>
         <div className="panel-header" style={{ borderLeft: '4px solid var(--accent)' }}>
-          <span className="panel-title">Utilitas Database & Backup Cadangan (Kompresi Aktif)</span>
+          <span className="panel-title">Utilitas Database & Backup Cadangan Excel</span>
         </div>
         <div className="panel-body">
           <p style={{ fontSize: '0.85rem', color: 'var(--text-muted)', marginBottom: '16px' }}>
-            Aplikasi ini dilengkapi <strong>Kompresi Gambar Otomatis</strong> (~97% lebih hemat ruang DB). Gunakan menu di bawah untuk mengamankan data Anda:
+            Simpan salinan produk, transaksi, nota pembelian, pengeluaran, dan lampiran dalam workbook Excel (.xlsx). Pemulihan akan mengganti seluruh data yang sedang tersimpan.
           </p>
           <div style={{ display: 'flex', gap: '12px', flexWrap: 'wrap' }}>
             
-            {/* Tombol Export Backup */}
             <button 
               className="btn btn-secondary" 
-              onClick={() => {
-                try {
-                  const backup = {
-                    version: 1,
-                    timestamp: new Date().toISOString(),
-                    products: JSON.parse(localStorage.getItem('toko_produk') || '[]'),
-                    transactions: JSON.parse(localStorage.getItem('toko_transaksi') || '[]'),
-                    // Fix #1 QA: Gunakan key yang benar sesuai db.js
-                    purchases: JSON.parse(localStorage.getItem('toko_pembelian') || '[]'),
-                    expenses: JSON.parse(localStorage.getItem('toko_pengeluaran') || '[]')
-                  };
-                  const dataStr = "data:text/json;charset=utf-8," + encodeURIComponent(JSON.stringify(backup, null, 2));
-                  const downloadAnchor = document.createElement('a');
-                  downloadAnchor.setAttribute("href", dataStr);
-                  downloadAnchor.setAttribute("download", `kod_elektronik_backup_${new Date().toISOString().slice(0,10)}.json`);
-                  document.body.appendChild(downloadAnchor);
-                  downloadAnchor.click();
-                  downloadAnchor.remove();
-                  showToast('Database berhasil diexport sebagai file JSON!', 'success');
-                } catch (err) {
-                  showToast('Gagal mengekspor backup.', 'error');
-                }
-              }}
+              onClick={handleExportBackup}
             >
-              Simpan Backup (Download JSON)
+              Simpan Backup Excel (.xlsx)
             </button>
 
-            {/* Input File & Tombol Import Restore */}
             <label className="btn btn-secondary" style={{ cursor: 'pointer', position: 'relative', display: 'inline-block' }}>
-              Restore Database (Upload JSON)
+              Pulihkan dari Excel (.xlsx)
               <input 
                 type="file" 
-                accept=".json"
+                accept=".xlsx,application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
                 style={{ position: 'absolute', top: 0, left: 0, opacity: 0, width: '100%', height: '100%', cursor: 'pointer' }}
-                onChange={(e) => {
-                  const file = e.target.files[0];
-                  if (!file) return;
-                  const reader = new FileReader();
-                  reader.onload = async (event) => {
-                    try {
-                      const backup = JSON.parse(event.target.result);
-                      if (!backup.products || !backup.transactions || !backup.purchases || !backup.expenses) {
-                        showToast('File backup tidak valid!', 'error');
-                        return;
-                      }
-                      
-                      // Konfirmasi restore data
-                      showConfirm('PERINGATAN: Restore data akan menimpa seluruh data saat ini di laptop/HP Anda. Lanjutkan?', () => {
-                        localStorage.setItem('toko_produk', JSON.stringify(backup.products));
-                        localStorage.setItem('toko_transaksi', JSON.stringify(backup.transactions));
-                        // Fix #1 QA: Gunakan key yang benar sesuai db.js
-                        localStorage.setItem('toko_pembelian', JSON.stringify(backup.purchases));
-                        localStorage.setItem('toko_pengeluaran', JSON.stringify(backup.expenses));
-                        
-                        showToast('Database berhasil di-restore!', 'success');
-                        fetchData();
-                      });
-                    } catch (err) {
-                      showToast('Gagal membaca file backup.', 'error');
-                    }
-                  };
-                  reader.readAsText(file);
-                }}
+                onChange={handleRestoreBackup}
               />
             </label>
 
@@ -1580,7 +1630,7 @@ function DashboardView({ products, transactions, purchases, expenses, formatRupi
             <button 
               className="btn btn-danger"
               style={{ backgroundColor: 'var(--color-danger)', borderColor: 'var(--color-danger)' }}
-              onClick={async () => {
+              onClick={() => requestWriteAccess(() => {
                 showConfirm('Apakah Anda yakin ingin membersihkan foto bukti transfer & nota fisik yang sudah berumur lebih dari 3 bulan? Ini akan sangat menghemat ruang database cloud Anda.', () => {
                   try {
                     let clearedCount = 0;
@@ -1620,7 +1670,7 @@ function DashboardView({ products, transactions, purchases, expenses, formatRupi
                     showToast('Gagal membersihkan foto lama.', 'error');
                   }
                 });
-              }}
+              })}
             >
               Bersihkan Foto Bukti Lama (&gt; 3 Bulan)
             </button>
@@ -1726,8 +1776,13 @@ function DashboardView({ products, transactions, purchases, expenses, formatRupi
                         <tbody>
                           {filteredPur.filter(p => p.status === 'Lunas').map(p => (
                             <tr key={p.id}>
-                              <td style={{ fontSize: '0.8rem' }}>{new Date(p.tanggal).toLocaleDateString('id-ID', { day: 'numeric', month: 'short' })}</td>
-                              <td style={{ fontWeight: '600' }}>{p.nama_supplier}</td>
+                              <td style={{ fontSize: '0.8rem' }}>{new Date(p.tanggal_pelunasan || p.tanggal).toLocaleDateString('id-ID', { day: 'numeric', month: 'short' })}</td>
+                              <td style={{ fontWeight: '600' }}>
+                                {p.nama_supplier}
+                                {p.sumber_data === 'Simulasi otomatis (DEMO)' && (
+                                  <span className="badge badge-warning" style={{ marginLeft: '6px', fontSize: '0.68rem' }}>DEMO</span>
+                                )}
+                              </td>
                               <td style={{ fontSize: '0.8rem' }}>{p.items?.map(i => `${i.nama_produk} (${i.jumlah} pcs)`).join(', ')}</td>
                               <td style={{ fontWeight: 'bold', color: 'var(--color-danger)' }}>{formatRupiah(p.total_nota)}</td>
                             </tr>
@@ -1758,7 +1813,12 @@ function DashboardView({ products, transactions, purchases, expenses, formatRupi
                             <tr key={e.id}>
                               <td style={{ fontSize: '0.8rem' }}>{new Date(e.tanggal).toLocaleDateString('id-ID', { day: 'numeric', month: 'short' })}</td>
                               <td><span className="badge badge-warning">{e.kategori}</span></td>
-                              <td style={{ fontSize: '0.8rem' }}>{e.keterangan || '-'}</td>
+                              <td style={{ fontSize: '0.8rem' }}>
+                                {e.keterangan || '-'}
+                                {e.sumber_data === 'Simulasi otomatis (DEMO)' && (
+                                  <span className="badge badge-warning" style={{ marginLeft: '6px', fontSize: '0.68rem' }}>DEMO</span>
+                                )}
+                              </td>
                               <td style={{ fontWeight: 'bold', color: 'var(--color-danger)' }}>{formatRupiah(e.jumlah)}</td>
                             </tr>
                           ))}
@@ -1823,7 +1883,7 @@ function DashboardView({ products, transactions, purchases, expenses, formatRupi
               {activeDetailModal === 'hutang' && (
                 <div>
                   <p style={{ marginBottom: '16px', color: 'var(--text-muted)', fontSize: '0.85rem' }}>
-                    Daftar hutang nyambut barang ke supplier yang belum dilunasi:
+                    Daftar hutang pembelian barang ke supplier yang belum dilunasi:
                   </p>
                   {tempoPurchases.length === 0 ? (
                     <p style={{ textAlign: 'center', color: 'var(--text-muted)', padding: '24px' }}>Tidak ada hutang ke supplier yang terutang.</p>
@@ -1841,7 +1901,12 @@ function DashboardView({ products, transactions, purchases, expenses, formatRupi
                         <tbody>
                           {tempoPurchases.map(p => (
                             <tr key={p.id}>
-                              <td style={{ fontWeight: 'bold' }}>{p.nama_supplier}</td>
+                              <td style={{ fontWeight: 'bold' }}>
+                                {p.nama_supplier}
+                                {p.sumber_data === 'Simulasi otomatis (DEMO)' && (
+                                  <span className="badge badge-warning" style={{ marginLeft: '6px', fontSize: '0.68rem' }}>DEMO</span>
+                                )}
+                              </td>
                               <td style={{ color: 'var(--color-danger)', fontWeight: 'bold' }}>{formatRupiah(p.total_nota)}</td>
                               <td style={{ fontSize: '0.8rem', color: 'var(--text-muted)' }}>
                                 {new Date(p.tanggal).toLocaleDateString('id-ID', { day: 'numeric', month: 'short' })}
@@ -1932,12 +1997,13 @@ function DashboardView({ products, transactions, purchases, expenses, formatRupi
 // ----------------------------------------------------------------------------------
 // SUB-VIEW: POS KASIR (Kini dilengkapi Riwayat Penjualan Langsung & Bukti Transfer)
 // ----------------------------------------------------------------------------------
-function PosView({ products, transactions, formatRupiah, fetchData, setLastTxData, handleTriggerPrint, showToast }) {
+function PosView({ products, transactions, formatRupiah, fetchData, setLastTxData, handleTriggerPrint, showToast, requestWriteAccess }) {
   const [kasirLokasi, setKasirLokasi] = useState('Pasar'); // Pasar / Rumah
   // Fix #1: filter lokasi di riwayat kasir
   const [filterRiwayatLokasi, setFilterRiwayatLokasi] = useState('Semua');
   // Fix #6: expand riwayat lebih banyak
   const [riwayatLimit, setRiwayatLimit] = useState(10);
+  const [riwayatSearchQuery, setRiwayatSearchQuery] = useState('');
   const [searchQuery, setSearchQuery] = useState('');
   const [selectedCategory, setSelectedCategory] = useState('Semua');
   const [cart, setCart] = useState([]);
@@ -1960,6 +2026,27 @@ function PosView({ products, transactions, formatRupiah, fetchData, setLastTxDat
     const matchCat = selectedCategory === 'Semua' || p.kategori === selectedCategory;
     return matchSearch && matchCat;
   });
+  const filteredHistory = transactions.filter(tx => {
+    if (filterRiwayatLokasi !== 'Semua' && tx.lokasi_penjualan !== filterRiwayatLokasi) return false;
+    const query = riwayatSearchQuery.trim().toLocaleLowerCase('id-ID');
+    if (!query) return true;
+    const searchableValues = [
+      tx.nama_pelanggan,
+      tx.lokasi_penjualan,
+      tx.metode_pembayaran,
+      tx.status_pembayaran,
+      tx.tanggal,
+      new Date(tx.tanggal).toLocaleString('id-ID'),
+      tx.total_harga,
+      formatRupiah(tx.total_harga),
+      ...(tx.items || []).map(item => item.nama_produk)
+    ];
+    return searchableValues.some(value => String(value || '').toLocaleLowerCase('id-ID').includes(query));
+  });
+
+  useEffect(() => {
+    setRiwayatLimit(10);
+  }, [filterRiwayatLokasi, riwayatSearchQuery]);
 
   const handleTfFileChange = (e) => {
     const file = e.target.files[0];
@@ -1993,7 +2080,7 @@ function PosView({ products, transactions, formatRupiah, fetchData, setLastTxDat
         id: product.id,
         nama: product.nama,
         harga_beli: product.harga_beli_default,
-        harga_jual: product.harga_jual_default,
+        harga_jual: '',
         qty: 1
       }];
     });
@@ -2017,10 +2104,15 @@ function PosView({ products, transactions, formatRupiah, fetchData, setLastTxDat
     setCart(prev => prev.filter(item => item.id !== id));
   };
 
-  const totalBelanja = cart.reduce((sum, item) => sum + (item.harga_jual * item.qty), 0);
+  const totalBelanja = cart.reduce((sum, item) => sum + (parseNominal(item.harga_jual) * item.qty), 0);
 
   const handleCheckout = async () => {
     if (cart.length === 0) return;
+    const itemWithoutValidPrice = cart.find((item) => parseNominal(item.harga_jual) <= 0);
+    if (itemWithoutValidPrice) {
+      showToast(`Masukkan harga jual lebih dari Rp0 untuk "${itemWithoutValidPrice.nama}".`, 'error');
+      return;
+    }
     if (paymentMethod === 'Tempo' && !customerName.trim()) {
       showToast('Wajib memasukkan Nama Pelanggan untuk TEMPO!', 'error');
       return;
@@ -2038,24 +2130,25 @@ function PosView({ products, transactions, formatRupiah, fetchData, setLastTxDat
         nama_produk: item.nama,
         jumlah: item.qty,
         harga_beli_saat_ini: item.harga_beli,
-        harga_jual_saat_ini: item.harga_jual
+        harga_jual_saat_ini: parseNominal(item.harga_jual)
       }))
     };
 
-    try {
-      const tx = await dbService.createTransaction(txPayload);
-      // Fix #4: Simpan lastTxData dengan id dari hasil create (untuk nomor struk)
-      setLastTxData({ ...txPayload, id: tx?.id, tanggal: new Date().toISOString() });
-      setCart([]);
-      setCustomerName('');
-      setTfFileBase64('');
-      setPreviewTfUrl('');
-      setCheckoutSuccess(true);
-      showToast('Transaksi penjualan sukses disimpan!', 'success');
-      fetchData();
-    } catch (e) {
-      showToast('Gagal menyimpan transaksi: ' + e.message, 'error');
-    }
+    requestWriteAccess(async () => {
+      try {
+        const tx = await dbService.createTransaction(txPayload);
+        setLastTxData({ ...txPayload, id: tx?.id, tanggal: new Date().toISOString() });
+        setCart([]);
+        setCustomerName('');
+        setTfFileBase64('');
+        setPreviewTfUrl('');
+        setCheckoutSuccess(true);
+        showToast('Transaksi penjualan sukses disimpan!', 'success');
+        fetchData();
+      } catch (e) {
+        showToast('Gagal menyimpan transaksi: ' + e.message, 'error');
+      }
+    });
   };
 
   // Fix #4: Gunakan lastTxData (snapshot sebelum cart dikosongkan) untuk struk WA
@@ -2086,7 +2179,7 @@ function PosView({ products, transactions, formatRupiah, fetchData, setLastTxDat
       <div className="pos-layout">
         {/* Katalog Barang (Kiri) */}
         <div className="pos-catalog no-print">
-          <div style={{ display: 'flex', gap: '16px', flexWrap: 'wrap' }} className="form-row">
+          <div style={{ gap: '16px' }} className="form-row">
             <div style={{ flex: '0 0 200px' }}>
               <label style={{ fontSize: '0.85rem', fontWeight: 'bold', color: 'var(--text-muted)', display: 'block', marginBottom: '6px' }}>Pilih Lokasi Jualan:</label>
               <select 
@@ -2105,8 +2198,8 @@ function PosView({ products, transactions, formatRupiah, fetchData, setLastTxDat
                 }}
                 style={{ fontWeight: 'bold', borderColor: 'var(--accent)' }}
               >
-                <option value="Pasar">Pasar (Ayah)</option>
-                <option value="Rumah">Rumah (Ibu)</option>
+                <option value="Pasar">Pasar</option>
+                <option value="Rumah">Rumah</option>
               </select>
             </div>
 
@@ -2145,7 +2238,7 @@ function PosView({ products, transactions, formatRupiah, fetchData, setLastTxDat
                     <div className="product-name" style={{ fontSize: '0.9rem' }}>{p.nama}</div>
                   </div>
                   <div>
-                    <div className="product-price" style={{ fontSize: '1rem', color: 'var(--accent)' }}>{formatRupiah(p.harga_jual_default)}</div>
+                    <div className="product-price" style={{ fontSize: '0.82rem', color: 'var(--text-muted)' }}>Harga ditentukan saat transaksi</div>
                     <div className="product-stocks">
                       <span className="stock-tag">
                         <span>Stok {kasirLokasi}:</span>
@@ -2188,7 +2281,30 @@ function PosView({ products, transactions, formatRupiah, fetchData, setLastTxDat
                   <div key={item.id} className="cart-item">
                     <div className="cart-item-details">
                       <div className="cart-item-name" style={{ fontSize: '0.85rem' }}>{item.nama}</div>
-                      <div className="cart-item-price">{formatRupiah(item.harga_jual)}</div>
+                      <label style={{ display: 'block', marginTop: '6px', fontSize: '0.75rem', color: 'var(--text-muted)' }}>
+                        Harga jual per unit
+                        <div className="input-group" style={{ marginTop: '3px' }}>
+                          <span className="input-group-addon">Rp</span>
+                          <NominalInput
+                            required
+                            className="form-control"
+                            aria-label={`Harga jual per unit ${item.nama}`}
+                            placeholder="Isi harga"
+                            value={item.harga_jual}
+                            onValueChange={(value) => setCart((prev) => prev.map((cartItem) => (
+                              cartItem.id === item.id ? { ...cartItem, harga_jual: value } : cartItem
+                            )))}
+                          />
+                        </div>
+                      </label>
+                      {parseNominal(item.harga_jual) > 0 && parseNominal(item.harga_jual) < Number(item.harga_beli) && (
+                        <small style={{ display: 'block', color: 'var(--color-warning)', marginTop: '4px' }}>
+                          Di bawah modal {formatRupiah(item.harga_beli)}; transaksi tetap dapat dilanjutkan.
+                        </small>
+                      )}
+                      <div className="cart-item-price" style={{ marginTop: '4px' }}>
+                        Subtotal: {formatRupiah(parseNominal(item.harga_jual) * item.qty)}
+                      </div>
                     </div>
                     <div className="cart-item-qty">
                       <button className="qty-btn" onClick={() => updateQty(item.id, -1, maxStock)}>-</button>
@@ -2301,8 +2417,24 @@ function PosView({ products, transactions, formatRupiah, fetchData, setLastTxDat
           </div>
         </div>
         <div className="panel-body" style={{ padding: 0 }}>
+          <div style={{ padding: '12px 16px', borderBottom: '1px solid var(--border-color)' }}>
+            <div style={{ position: 'relative' }}>
+              <Search size={17} aria-hidden="true" style={{ position: 'absolute', left: '12px', top: '50%', transform: 'translateY(-50%)', color: 'var(--text-muted)' }} />
+              <input
+                type="search"
+                className="form-control"
+                aria-label="Cari riwayat transaksi kasir"
+                placeholder="Cari pelanggan, barang, tanggal, metode bayar, atau nominal..."
+                value={riwayatSearchQuery}
+                onChange={(event) => setRiwayatSearchQuery(event.target.value)}
+                style={{ paddingLeft: '38px' }}
+              />
+            </div>
+          </div>
           {transactions.length === 0 ? (
             <p style={{ padding: '24px', color: 'var(--text-muted)', fontSize: '0.9rem', textAlign: 'center' }}>Belum ada transaksi penjualan yang tercatat.</p>
+          ) : filteredHistory.length === 0 ? (
+            <p style={{ padding: '24px', color: 'var(--text-muted)', fontSize: '0.9rem', textAlign: 'center' }}>Tidak ada transaksi yang cocok dengan pencarian.</p>
           ) : (
             <div className="table-responsive">
               <table>
@@ -2318,9 +2450,7 @@ function PosView({ products, transactions, formatRupiah, fetchData, setLastTxDat
                   </tr>
                 </thead>
                 <tbody>
-                  {transactions
-                    .filter(tx => filterRiwayatLokasi === 'Semua' || tx.lokasi_penjualan === filterRiwayatLokasi)
-                    .slice(0, riwayatLimit).map(tx => (
+                  {filteredHistory.slice(0, riwayatLimit).map(tx => (
                     <tr key={tx.id}>
                       <td style={{ fontSize: '0.85rem' }}>
                         <div>{new Date(tx.tanggal).toLocaleString('id-ID', { dateStyle: 'medium', timeStyle: 'short' })}</div>
@@ -2335,7 +2465,12 @@ function PosView({ products, transactions, formatRupiah, fetchData, setLastTxDat
                           {tx.lokasi_penjualan}
                         </span>
                       </td>
-                      <td style={{ fontWeight: '600' }}>{tx.nama_pelanggan || 'Umum'}</td>
+                      <td style={{ fontWeight: '600' }}>
+                        {tx.nama_pelanggan || 'Umum'}
+                        {tx.sumber_data === 'Simulasi otomatis (DEMO)' && (
+                          <span className="badge badge-warning" style={{ marginLeft: '6px', fontSize: '0.68rem' }}>DEMO</span>
+                        )}
+                      </td>
                       <td style={{ fontSize: '0.85rem', maxWidth: '300px', whiteSpace: 'nowrap', overflow: 'hidden', textOverflow: 'ellipsis' }}>
                         {tx.items?.map(i => `${i.nama_produk} (${i.jumlah} pcs)`).join(', ')}
                       </td>
@@ -2367,14 +2502,14 @@ function PosView({ products, transactions, formatRupiah, fetchData, setLastTxDat
             </div>
           )}
           {/* Fix #6: Tombol lihat lebih banyak riwayat */}
-          {transactions.filter(tx => filterRiwayatLokasi === 'Semua' || tx.lokasi_penjualan === filterRiwayatLokasi).length > riwayatLimit && (
+          {filteredHistory.length > riwayatLimit && (
             <div style={{ padding: '12px 16px', textAlign: 'center', borderTop: '1px solid var(--border-color)' }}>
               <button
                 className="btn btn-secondary btn-sm"
                 onClick={() => setRiwayatLimit(prev => prev + 10)}
                 style={{ fontSize: '0.8rem' }}
               >
-                Lihat 10 Riwayat Berikutnya (dari {transactions.filter(tx => filterRiwayatLokasi === 'Semua' || tx.lokasi_penjualan === filterRiwayatLokasi).length} transaksi)
+                Lihat 10 Riwayat Berikutnya (dari {filteredHistory.length} transaksi)
               </button>
             </div>
           )}
@@ -2449,39 +2584,63 @@ function PosView({ products, transactions, formatRupiah, fetchData, setLastTxDat
 // ----------------------------------------------------------------------------------
 // SUB-VIEW: STOK BARANG / KATALOG
 // ----------------------------------------------------------------------------------
-function ProductsView({ products, formatRupiah, fetchData, showToast, showConfirm }) {
-  const [showAddModal, setShowAddModal] = useState(false);
+function InventoryView({ products, purchases, formatRupiah, fetchData, showToast, showConfirm, handleTriggerPrint, setPrintProducts, requestWriteAccess }) {
+  return (
+    <div className="inventory-view">
+      <PurchasesView
+        products={products}
+        purchases={purchases}
+        formatRupiah={formatRupiah}
+        fetchData={fetchData}
+        showToast={showToast}
+        requestWriteAccess={requestWriteAccess}
+      />
+      <ProductsView
+        products={products}
+        formatRupiah={formatRupiah}
+        fetchData={fetchData}
+        showToast={showToast}
+        showConfirm={showConfirm}
+        handleTriggerPrint={handleTriggerPrint}
+        setPrintProducts={setPrintProducts}
+        requestWriteAccess={requestWriteAccess}
+      />
+    </div>
+  );
+}
+
+function ProductsView({ products, formatRupiah, fetchData, showToast, showConfirm, handleTriggerPrint, setPrintProducts, requestWriteAccess }) {
   const [showEditModal, setShowEditModal] = useState(false);
   const [searchQuery, setSearchQuery] = useState('');
+  const [categoryFilter, setCategoryFilter] = useState('Semua');
+  const [stockFilter, setStockFilter] = useState('Semua');
   
   const [formData, setFormData] = useState({
     nama: '',
     kategori: '',
     harga_beli_default: '',
-    harga_jual_default: '',
     stok_minimum: 5,
     stok_rumah: 0,
     stok_pasar: 0
   });
   const [selectedProductId, setSelectedProductId] = useState(null);
+  const productBeingEdited = products.find((product) => String(product.id) === String(selectedProductId));
+  const currentTotal = productBeingEdited
+    ? Number(productBeingEdited.stok_rumah) + Number(productBeingEdited.stok_pasar) + Number(productBeingEdited.stok_belum_dialokasikan || 0)
+    : 0;
 
-  const filteredProducts = products.filter(p => 
-    p.nama.toLowerCase().includes(searchQuery.toLowerCase()) ||
-    p.kategori.toLowerCase().includes(searchQuery.toLowerCase())
-  );
-
-  const handleOpenAdd = () => {
-    setFormData({
-      nama: '',
-      kategori: 'Lampu',
-      harga_beli_default: '',
-      harga_jual_default: '',
-      stok_minimum: 5,
-      stok_rumah: 0,
-      stok_pasar: 0
-    });
-    setShowAddModal(true);
-  };
+  const filteredProducts = useMemo(() => products.filter(p =>
+    (p.nama.toLowerCase().includes(searchQuery.toLowerCase()) ||
+    p.kategori.toLowerCase().includes(searchQuery.toLowerCase())) &&
+    (categoryFilter === 'Semua' || p.kategori === categoryFilter) &&
+    (stockFilter === 'Semua' ||
+      (stockFilter === 'Menipis' && (p.stok_rumah < p.stok_minimum || p.stok_pasar < p.stok_minimum)) ||
+      (stockFilter === 'Belum dialokasikan' && Number(p.stok_belum_dialokasikan) > 0))
+  ), [products, searchQuery, categoryFilter, stockFilter]);
+  const categories = [...new Set(products.map((product) => product.kategori))].sort((a, b) => a.localeCompare(b, 'id'));
+  useEffect(() => {
+    setPrintProducts(filteredProducts);
+  }, [filteredProducts, setPrintProducts]);
 
   const handleOpenEdit = (product) => {
     setSelectedProductId(product.id);
@@ -2489,7 +2648,6 @@ function ProductsView({ products, formatRupiah, fetchData, showToast, showConfir
       nama: product.nama,
       kategori: product.kategori,
       harga_beli_default: product.harga_beli_default !== undefined && product.harga_beli_default !== null ? product.harga_beli_default : '',
-      harga_jual_default: product.harga_jual_default !== undefined && product.harga_jual_default !== null ? product.harga_jual_default : '',
       stok_minimum: product.stok_minimum,
       stok_rumah: product.stok_rumah,
       stok_pasar: product.stok_pasar
@@ -2497,50 +2655,37 @@ function ProductsView({ products, formatRupiah, fetchData, showToast, showConfir
     setShowEditModal(true);
   };
 
-  const handleAddSubmit = async (e) => {
-    e.preventDefault();
-    try {
-      await dbService.addProduct({
-        ...formData,
-        harga_beli_default: Number(formData.harga_beli_default) || 0,
-        harga_jual_default: Number(formData.harga_jual_default) || 0,
-        stok_rumah: Number(formData.stok_rumah) || 0,
-        stok_pasar: Number(formData.stok_pasar) || 0,
-        stok_minimum: Number(formData.stok_minimum) || 0
-      });
-      setShowAddModal(false);
-      showToast(`Produk "${formData.nama}" berhasil didaftarkan!`, 'success');
-      fetchData();
-    } catch (err) {
-      console.error('Gagal menambah produk:', err);
-      showToast(`Gagal menambah produk: ${err.message || 'cek koneksi Supabase'}`, 'error');
-    }
-  };
-
   const handleEditSubmit = async (e) => {
     e.preventDefault();
-    try {
-      await dbService.updateProduct(selectedProductId, {
-        ...formData,
-        harga_beli_default: Number(formData.harga_beli_default) || 0,
-        harga_jual_default: Number(formData.harga_jual_default) || 0,
-        stok_rumah: Number(formData.stok_rumah) || 0,
-        stok_pasar: Number(formData.stok_pasar) || 0,
-        stok_minimum: Number(formData.stok_minimum) || 0
-      });
-      setShowEditModal(false);
-      showToast('Stok & harga produk berhasil disesuaikan!', 'success');
-      fetchData();
-    } catch (err) {
-      console.error('Gagal menyimpan penyesuaian produk:', err);
-      showToast(`Gagal menyimpan penyesuaian: ${err.message || 'cek koneksi Supabase'}`, 'error');
+    const distributedTotal = Number(formData.stok_rumah) + Number(formData.stok_pasar);
+    if (distributedTotal !== currentTotal) {
+      showToast(`Total distribusi harus tetap ${currentTotal} pcs.`, 'error');
+      return;
     }
+    requestWriteAccess(async () => {
+      try {
+        await dbService.updateProduct(selectedProductId, {
+          ...formData,
+          harga_beli_default: Number(formData.harga_beli_default) || 0,
+          stok_rumah: Number(formData.stok_rumah) || 0,
+          stok_pasar: Number(formData.stok_pasar) || 0,
+          stok_belum_dialokasikan: 0,
+          stok_minimum: Number(formData.stok_minimum) || 0
+        });
+        setShowEditModal(false);
+        showToast('Detail dan distribusi stok diperbarui tanpa mengubah total barang.', 'success');
+        fetchData();
+      } catch (err) {
+        console.error('Gagal menyimpan penyesuaian produk:', err);
+        showToast(`Gagal menyimpan penyesuaian: ${err.message || 'cek koneksi Supabase'}`, 'error');
+      }
+    });
   };
 
   return (
     <div>
-      <div style={{ display: 'flex', justifyContent: 'space-between', marginBottom: '20px', gap: '16px', flexWrap: 'wrap' }} className="no-print">
-        <div style={{ flex: 1, maxWidth: '400px' }}>
+      <div style={{ display: 'flex', alignItems: 'center', marginBottom: '20px', gap: '10px', flexWrap: 'wrap' }} className="no-print">
+        <div style={{ flex: '1 1 220px', maxWidth: '400px' }}>
           <input 
             type="text" 
             placeholder="Cari barang di katalog..." 
@@ -2549,8 +2694,20 @@ function ProductsView({ products, formatRupiah, fetchData, showToast, showConfir
             onChange={(e) => setSearchQuery(e.target.value)}
           />
         </div>
-        <button className="btn btn-primary" onClick={handleOpenAdd}>
-          <Plus size={18} /> Tambah Barang Baru
+        <select className="form-control" aria-label="Filter kategori stok" style={{ width: 'auto', minWidth: '145px' }} value={categoryFilter} onChange={(e) => setCategoryFilter(e.target.value)}>
+          <option value="Semua">Semua kategori</option>
+          {categories.map((category) => <option key={category} value={category}>{category}</option>)}
+        </select>
+        <select className="form-control" aria-label="Filter kondisi stok" style={{ width: 'auto', minWidth: '165px' }} value={stockFilter} onChange={(e) => setStockFilter(e.target.value)}>
+          <option value="Semua">Semua kondisi stok</option>
+          <option value="Menipis">Stok menipis</option>
+          <option value="Belum dialokasikan">Belum dialokasikan</option>
+        </select>
+        <button type="button" className="btn btn-secondary" onClick={() => handleTriggerPrint('stock')}>
+          <Printer size={16} /> Cetak Laporan Stok
+        </button>
+        <button type="button" className="btn btn-primary" onClick={() => handleTriggerPrint('stocktake')}>
+          <Printer size={16} /> Cetak Lembar Opname
         </button>
       </div>
 
@@ -2566,9 +2723,10 @@ function ProductsView({ products, formatRupiah, fetchData, showToast, showConfir
                   <th>Nama Barang</th>
                   <th>Jenis (Kategori)</th>
                   <th>Harga Beli (Modal)</th>
-                  <th>Harga Jual (Grosir/Ecer)</th>
                   <th>Stok Rumah (Gudang)</th>
                   <th>Stok Pasar</th>
+                  <th>Belum Dialokasikan</th>
+                  <th>Total Stok</th>
                   <th>Batas Minimum</th>
                   <th className="no-print">Aksi</th>
                 </tr>
@@ -2577,6 +2735,7 @@ function ProductsView({ products, formatRupiah, fetchData, showToast, showConfir
                 {filteredProducts.map(p => {
                   const lowRumah = p.stok_rumah < p.stok_minimum;
                   const lowPasar = p.stok_pasar < p.stok_minimum;
+                  const totalStok = (Number(p.stok_rumah) || 0) + (Number(p.stok_pasar) || 0) + (Number(p.stok_belum_dialokasikan) || 0);
                   return (
                     <tr key={p.id}>
                       <td style={{ fontWeight: '600' }}>{p.nama}</td>
@@ -2584,22 +2743,25 @@ function ProductsView({ products, formatRupiah, fetchData, showToast, showConfir
                         <span className="badge badge-info">{p.kategori}</span>
                       </td>
                       <td style={{ color: 'var(--text-muted)' }}>{formatRupiah(p.harga_beli_default)}</td>
-                      <td style={{ fontWeight: '600', color: 'var(--accent)' }}>{formatRupiah(p.harga_jual_default)}</td>
                       <td style={{ fontWeight: lowRumah ? 'bold' : 'normal', color: lowRumah ? 'var(--color-danger)' : 'inherit' }}>
                         {p.stok_rumah} pcs {lowRumah && '⚠️'}
                       </td>
                       <td style={{ fontWeight: lowPasar ? 'bold' : 'normal', color: lowPasar ? 'var(--color-danger)' : 'inherit' }}>
                         {p.stok_pasar} pcs {lowPasar && '⚠️'}
                       </td>
+                      <td style={{ fontWeight: p.stok_belum_dialokasikan ? 'bold' : 'normal', color: p.stok_belum_dialokasikan ? 'var(--color-warning)' : 'inherit' }}>
+                        {p.stok_belum_dialokasikan} pcs
+                      </td>
+                      <td style={{ fontWeight: 'bold' }}>{totalStok} pcs</td>
                       <td>{p.stok_minimum} pcs</td>
                       <td className="no-print" style={{ display: 'flex', gap: '8px' }}>
-                        <button className="btn btn-secondary btn-sm" onClick={() => handleOpenEdit(p)}>
-                          Ubah
+                        <button className="btn btn-secondary btn-sm" onClick={() => requestWriteAccess(() => handleOpenEdit(p))}>
+                          Atur Stok
                         </button>
                         <button 
                           className="btn btn-danger btn-sm" 
                           style={{ padding: '6px 10px' }}
-                          onClick={async () => {
+                          onClick={() => requestWriteAccess(() => {
                             showConfirm(`Apakah Anda yakin ingin menghapus produk "${p.nama}" dari katalog?`, async () => {
                               try {
                                 await dbService.deleteProduct(p.id);
@@ -2609,7 +2771,7 @@ function ProductsView({ products, formatRupiah, fetchData, showToast, showConfir
                                 showToast('Gagal menghapus produk.', 'error');
                               }
                             });
-                          }}
+                          })}
                         >
                           <Trash2 size={14} />
                         </button>
@@ -2623,114 +2785,12 @@ function ProductsView({ products, formatRupiah, fetchData, showToast, showConfir
         </div>
       </div>
 
-      {/* Modal Add Product */}
-      {showAddModal && (
-        <div className="modal-overlay no-print">
-          <div className="modal-container">
-            <div className="modal-header">
-              <span className="modal-title">Tambah Produk Baru</span>
-              <button className="btn-icon-only btn-sm" onClick={() => setShowAddModal(false)}>X</button>
-            </div>
-            <form onSubmit={handleAddSubmit}>
-              <div className="modal-body">
-                <div className="form-group">
-                  <label>Nama Barang:</label>
-                  <input 
-                    type="text" 
-                    required 
-                    className="form-control" 
-                    placeholder="Philips LED Bulb 12W, Baterai ABC Alkaline, dll"
-                    value={formData.nama}
-                    onChange={(e) => setFormData({ ...formData, nama: e.target.value })}
-                  />
-                </div>
-                          <div className="form-group">
-                  <label>Jenis (Kategori):</label>
-                  <input 
-                    type="text" 
-                    required 
-                    className="form-control" 
-                    placeholder="Lampu, Baterai, Kabel, Stopkontak, dll"
-                    value={formData.kategori}
-                    onChange={(e) => setFormData({ ...formData, kategori: e.target.value })}
-                  />
-                </div>
-                <div className="form-row">
-                  <div className="form-group">
-                    <label>Harga Beli Default (Modal):</label>
-                    <div className="input-group">
-                      <span className="input-group-addon">Rp</span>
-                      <input 
-                        type="number" 
-                        required 
-                        className="form-control"
-                        value={formData.harga_beli_default}
-                        onChange={(e) => setFormData({ ...formData, harga_beli_default: e.target.value })}
-                      />
-                    </div>
-                  </div>
-                  <div className="form-group">
-                    <label>Harga Jual Default:</label>
-                    <div className="input-group">
-                      <span className="input-group-addon">Rp</span>
-                      <input 
-                        type="number" 
-                        required 
-                        className="form-control"
-                        value={formData.harga_jual_default}
-                        onChange={(e) => setFormData({ ...formData, harga_jual_default: e.target.value })}
-                      />
-                    </div>
-                  </div>
-                </div>
-                <div className="form-row">
-                  <div className="form-group">
-                    <label>Stok Rumah (Awal):</label>
-                    <input 
-                      type="number" 
-                      required 
-                      className="form-control"
-                      value={formData.stok_rumah}
-                      onChange={(e) => setFormData({ ...formData, stok_rumah: Number(e.target.value) })}
-                    />
-                  </div>
-                  <div className="form-group">
-                    <label>Stok Pasar (Awal):</label>
-                    <input 
-                      type="number" 
-                      required 
-                      className="form-control"
-                      value={formData.stok_pasar}
-                      onChange={(e) => setFormData({ ...formData, stok_pasar: Number(e.target.value) })}
-                    />
-                  </div>
-                </div>
-                <div className="form-group">
-                  <label>Batas Minim Stok Alert (Peringatan):</label>
-                  <input 
-                    type="number" 
-                    required 
-                    className="form-control"
-                    value={formData.stok_minimum}
-                    onChange={(e) => setFormData({ ...formData, stok_minimum: Number(e.target.value) })}
-                  />
-                </div>
-              </div>
-              <div className="modal-footer">
-                <button type="button" className="btn btn-secondary" onClick={() => setShowAddModal(false)}>Batal</button>
-                <button type="submit" className="btn btn-primary">Simpan</button>
-              </div>
-            </form>
-          </div>
-        </div>
-      )}
-
       {/* Modal Edit Product */}
       {showEditModal && (
         <div className="modal-overlay no-print">
           <div className="modal-container">
             <div className="modal-header">
-              <span className="modal-title">Ubah Detail Produk & Stok</span>
+              <span className="modal-title">Atur Produk & Distribusi Stok</span>
               <button className="btn-icon-only btn-sm" onClick={() => setShowEditModal(false)}>X</button>
             </div>
             <form onSubmit={handleEditSubmit}>
@@ -2755,40 +2815,26 @@ function ProductsView({ products, formatRupiah, fetchData, showToast, showConfir
                     onChange={(e) => setFormData({ ...formData, kategori: e.target.value })}
                   />
                 </div>
-                <div className="form-row">
-                  <div className="form-group">
-                    <label>Harga Beli Default (Modal):</label>
-                    <div className="input-group">
-                      <span className="input-group-addon">Rp</span>
-                      <input 
-                        type="number" 
-                        required 
-                        className="form-control"
-                        value={formData.harga_beli_default}
-                        onChange={(e) => setFormData({ ...formData, harga_beli_default: e.target.value })}
-                      />
-                    </div>
+                <div className="form-group">
+                  <label>Harga Beli (Modal):</label>
+                  <div className="input-group">
+                    <span className="input-group-addon">Rp</span>
+                    <NominalInput
+                      className="form-control"
+                      value={formData.harga_beli_default}
+                      readOnly
+                    />
                   </div>
-                  <div className="form-group">
-                    <label>Harga Jual Default:</label>
-                    <div className="input-group">
-                      <span className="input-group-addon">Rp</span>
-                      <input 
-                        type="number" 
-                        required 
-                        className="form-control"
-                        value={formData.harga_jual_default}
-                        onChange={(e) => setFormData({ ...formData, harga_jual_default: e.target.value })}
-                      />
-                    </div>
-                  </div>
+                  <small style={{ color: 'var(--text-muted)' }}>Dihitung otomatis dari transaksi pembelian.</small>
                 </div>
                 <div className="form-row">
                   <div className="form-group">
-                    <label>Stok Rumah (Gudang):</label>
+                    <label>Stok Rumah:</label>
                     <input 
                       type="number" 
                       required 
+                      min="0"
+                      step="1"
                       className="form-control"
                       value={formData.stok_rumah}
                       onChange={(e) => setFormData({ ...formData, stok_rumah: Number(e.target.value) })}
@@ -2799,12 +2845,17 @@ function ProductsView({ products, formatRupiah, fetchData, showToast, showConfir
                     <input 
                       type="number" 
                       required 
+                      min="0"
+                      step="1"
                       className="form-control"
                       value={formData.stok_pasar}
                       onChange={(e) => setFormData({ ...formData, stok_pasar: Number(e.target.value) })}
                     />
                   </div>
                 </div>
+                <p style={{ marginTop: '-8px', color: 'var(--text-muted)', fontSize: '0.8rem' }}>
+                  Total fisik yang harus dialokasikan: {currentTotal} pcs. Jumlah Stok Rumah + Stok Pasar wajib tepat sama dengan total ini.
+                </p>
                 <div className="form-group">
                   <label>Batas Minim Stok Alert (Peringatan):</label>
                   <input 
@@ -2829,366 +2880,210 @@ function ProductsView({ products, formatRupiah, fetchData, showToast, showConfir
 }
 
 // ----------------------------------------------------------------------------------
-// SUB-VIEW: NYAMBUT BARANG (PURCHASES)
+// PURCHASE FORM AND HISTORY WITHIN THE INVENTORY FEATURE
 // ----------------------------------------------------------------------------------
-function PurchasesView({ products, purchases, formatRupiah, fetchData, setActiveTab, showToast }) {
+function PurchasesView({ products, purchases, formatRupiah, fetchData, showToast, requestWriteAccess }) {
   const [supplierName, setSupplierName] = useState('');
-  const [purchaseItems, setPurchaseItems] = useState([]);
   const [purchaseStatus, setPurchaseStatus] = useState('Lunas'); // Lunas / Tempo
-  const [notaFileBase64, setNotaFileBase64] = useState('');
-  const [previewFileUrl, setPreviewFileUrl] = useState('');
-  
-  const [showAddProductShortcut, setShowAddProductShortcut] = useState(false);
-  const [newProdFormData, setNewProdFormData] = useState({
-    nama: '',
-    kategori: 'Lampu',
-    harga_beli_default: '',
-    harga_jual_default: '',
-    stok_minimum: 5,
-    stok_rumah: 0,
-    stok_pasar: 0
-  });
 
   const [activePreviewNotaImg, setActivePreviewNotaImg] = useState(null);
   
-  const [selectedProdId, setSelectedProdId] = useState('');
+  const [productName, setProductName] = useState('');
+  const [productCategory, setProductCategory] = useState('');
   const [inputQty, setInputQty] = useState(1);
-  const [inputBuyPrice, setInputBuyPrice] = useState('');
-  const [targetLocation, setTargetLocation] = useState('Rumah'); // Rumah / Pasar
+  const [purchaseTotal, setPurchaseTotal] = useState('');
+  const [isSaving, setIsSaving] = useState(false);
+
+  const matchedProduct = products.find((product) => product.nama.trim().toLocaleLowerCase() === productName.trim().toLocaleLowerCase());
 
   useEffect(() => {
-    if (selectedProdId) {
-      const prod = products.find(p => p.id === selectedProdId);
-      if (prod) {
-        setInputBuyPrice(prod.harga_beli_default !== undefined && prod.harga_beli_default !== null ? prod.harga_beli_default : '');
-      }
+    if (matchedProduct) {
+      setProductCategory(matchedProduct.kategori);
     }
-  }, [selectedProdId, products]);
+  }, [matchedProduct]);
 
-  const handleFileChange = (e) => {
-    const file = e.target.files[0];
-    if (!file) return;
-    compressImage(file, (compressedBase64) => {
-      setNotaFileBase64(compressedBase64); 
-      setPreviewFileUrl(compressedBase64);
-    });
-  };
+  const totalNota = parseNominal(purchaseTotal);
 
-  const handleAddItemToBill = () => {
-    if (!selectedProdId) return;
-    const prod = products.find(p => p.id === selectedProdId);
-    if (!prod) return;
-
-    setPurchaseItems(prev => {
-      const existingIndex = prev.findIndex(item => item.produk_id === selectedProdId && item.lokasi_tujuan === targetLocation);
-      if (existingIndex !== -1) {
-        const next = [...prev];
-        next[existingIndex].jumlah += Number(inputQty);
-        next[existingIndex].harga_beli = Number(inputBuyPrice) || 0;
-        return next;
-      }
-      return [...prev, {
-        produk_id: selectedProdId,
-        nama_produk: prod.nama,
-        jumlah: Number(inputQty),
-        harga_beli: Number(inputBuyPrice) || 0,
-        lokasi_tujuan: targetLocation
-      }];
-    });
-
-    setSelectedProdId('');
-    setInputQty(1);
-    setInputBuyPrice('');
-  };
-
-  const handleRemoveFromBill = (index) => {
-    setPurchaseItems(prev => prev.filter((_, idx) => idx !== index));
-  };
-
-  const totalNota = purchaseItems.reduce((sum, item) => sum + (item.harga_beli * item.jumlah), 0);
-
-  const handleSavePurchase = async (e) => {
+  const handleReceiveGoods = async (e) => {
     e.preventDefault();
+    if (isSaving) return;
     if (!supplierName.trim()) {
       showToast('Wajib mengisi Nama Supplier!', 'error');
       return;
     }
-    if (purchaseItems.length === 0) {
-      showToast('Daftar barang nyambut masih kosong!', 'error');
+    if (!productName.trim() || !productCategory.trim()) {
+      showToast('Nama dan jenis produk wajib diisi.', 'error');
       return;
     }
 
     const payload = {
       nama_supplier: supplierName,
-      total_nota: totalNota,
       status: purchaseStatus,
-      foto_nota: notaFileBase64,
-      items: purchaseItems
+      items: [{
+        ...(matchedProduct ? { produk_id: matchedProduct.id } : {}),
+        nama_produk: productName.trim(),
+        kategori: productCategory.trim(),
+        jumlah: Number(inputQty),
+        harga_beli: totalNota / Number(inputQty)
+      }]
     };
 
-    try {
-      await dbService.createPurchase(payload);
-      showToast('Nota Nyambut Barang tersimpan, stok bertambah!', 'success');
-      setSupplierName('');
-      setPurchaseItems([]);
-      setPurchaseStatus('Lunas');
-      setNotaFileBase64('');
-      setPreviewFileUrl('');
-      fetchData();
-      setActiveTab('dashboard'); 
-    } catch (err) {
-      console.error('Gagal mencatat Nyambut Barang:', err);
-      showToast(`Gagal mencatat Nyambut Barang: ${err.message || 'cek koneksi Supabase'}`, 'error');
-    }
-  };
-
-  const handleSaveProductShortcut = async (e) => {
-    e.preventDefault();
-    try {
-      const newProd = await dbService.addProduct({
-        ...newProdFormData,
-        harga_beli_default: Number(newProdFormData.harga_beli_default) || 0,
-        harga_jual_default: Number(newProdFormData.harga_jual_default) || 0,
-        stok_minimum: Number(newProdFormData.stok_minimum) || 0,
-        stok_rumah: Number(newProdFormData.stok_rumah) || 0,
-        stok_pasar: Number(newProdFormData.stok_pasar) || 0
-      });
-      showToast(`Produk "${newProd.nama}" terdaftar di katalog!`, 'success');
-      setShowAddProductShortcut(false);
-      await fetchData(); 
-      setSelectedProdId(newProd.id); 
-    } catch (err) {
-      console.error('Gagal mendaftarkan produk baru:', err);
-      showToast(`Gagal mendaftarkan produk baru: ${err.message || 'cek koneksi Supabase'}`, 'error');
-    }
+    requestWriteAccess(async () => {
+      try {
+        setIsSaving(true);
+        await dbService.createPurchase(payload);
+        const receivedName = productName.trim();
+        const receivedQuantity = Number(inputQty);
+        const wasNewProduct = !matchedProduct;
+        setProductName('');
+        setProductCategory('');
+        setInputQty(1);
+        setPurchaseTotal('');
+        setPurchaseStatus('Lunas');
+        try {
+          await fetchData({ showLoading: false, throwOnError: true });
+          showToast(`${receivedName} diterima: ${receivedQuantity} pcs masuk stok belum dialokasikan dan nota pembelian tercatat.${wasNewProduct ? ' Produk baru dibuat dari transaksi ini.' : ''}`, 'success');
+        } catch (refreshError) {
+          console.error('Penerimaan tersimpan, tetapi data stok gagal dimuat ulang:', refreshError);
+          showToast('Penerimaan dan stok sudah tersimpan, tetapi tampilan belum diperbarui. Muat ulang halaman.', 'error');
+        }
+      } catch (err) {
+        console.error('Gagal menerima barang dan memperbarui stok:', err);
+        showToast(`Gagal menerima barang: ${err.message || 'cek koneksi database'}`, 'error');
+      } finally {
+        setIsSaving(false);
+      }
+    });
   };
 
   return (
-    <div className="pos-layout">
-      {/* Detail Input Nota */}
-      <div className="panel-card no-print">
-        <div className="panel-header" style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center' }}>
-          <span className="panel-title">Daftar Barang yang Disambut</span>
-          <button 
-            type="button" 
-            className="btn btn-secondary btn-sm"
-            onClick={() => {
-              setNewProdFormData({
-                nama: '',
-                kategori: 'Lampu',
-                harga_beli_default: '',
-                harga_jual_default: '',
-                stok_minimum: 5,
-                stok_rumah: 0,
-                stok_pasar: 0
-              });
-              setShowAddProductShortcut(true);
-            }}
-          >
-            <Plus size={14} /> Daftarkan Barang Baru
-          </button>
+    <div className="purchase-layout">
+      <form onSubmit={handleReceiveGoods} className="panel-card no-print" style={{ gridColumn: '1 / -1' }}>
+        <div className="panel-header" style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', gap: '12px' }}>
+          <span className="panel-title">Penerimaan Barang</span>
         </div>
         <div className="panel-body">
-          <div style={{ display: 'flex', gap: '16px', flexWrap: 'wrap', marginBottom: '20px' }} className="form-row">
-            <div style={{ flex: 1 }}>
-              <label className="form-group" style={{ fontWeight: 'bold' }}>Pilih Nama Produk:</label>
-              <select 
+          <p style={{ margin: '0 0 18px', color: 'var(--text-muted)', fontSize: '0.85rem', lineHeight: 1.5 }}>
+            Catat barang yang benar-benar dibeli. Produk baru otomatis masuk katalog melalui transaksi ini; jumlahnya menjadi stok belum dialokasikan sampai dibagi ke Rumah dan Pasar.
+          </p>
+          <div className="form-row">
+            <div className="form-group" style={{ flex: '1 1 220px' }}>
+              <label>Supplier / Toko:</label>
+              <input
+                type="text"
                 className="form-control"
-                value={selectedProdId}
-                onChange={(e) => setSelectedProdId(e.target.value)}
-              >
-                <option value="">-- Pilih Barang --</option>
-                {products.map(p => (
-                  <option key={p.id} value={p.id}>{p.nama} ({p.kategori})</option>
-                ))}
-              </select>
-            </div>
-            <div style={{ flex: '0 0 100px' }}>
-              <label className="form-group" style={{ fontWeight: 'bold' }}>Jumlah:</label>
-              <input 
-                type="number" 
-                className="form-control"
-                min="1"
-                value={inputQty}
-                onChange={(e) => setInputQty(Number(e.target.value))}
+                required
+                placeholder="Nama supplier"
+                value={supplierName}
+                onChange={(e) => setSupplierName(e.target.value)}
               />
             </div>
-            <div style={{ flex: '0 0 180px' }}>
-              <label className="form-group" style={{ fontWeight: 'bold' }}>Harga Beli (Modal):</label>
+            <div className="form-group" style={{ flex: '2 1 240px' }}>
+              <label>Nama Barang:</label>
+              <input
+                type="text"
+                className="form-control"
+                required
+                list="known-inventory-products"
+                placeholder="misal: Kabel NYM 2x1.5"
+                value={productName}
+                onChange={(e) => {
+                  const name = e.target.value;
+                  setProductName(name);
+                  const existing = products.find((product) => product.nama.trim().toLocaleLowerCase() === name.trim().toLocaleLowerCase());
+                  if (existing) setProductCategory(existing.kategori);
+                  else setProductCategory('');
+                }}
+              />
+              <datalist id="known-inventory-products">
+                {products.map(product => (
+                  <option key={product.id} value={product.nama} />
+                ))}
+              </datalist>
+            </div>
+            <div className="form-group" style={{ flex: '1 1 160px' }}>
+              <label>Jenis / Kategori:</label>
+              <input
+                type="text"
+                className="form-control"
+                required
+                placeholder="misal: Kabel"
+                value={productCategory}
+                onChange={(e) => setProductCategory(e.target.value)}
+                readOnly={Boolean(matchedProduct)}
+              />
+            </div>
+            <div className="form-group" style={{ flex: '0 1 120px' }}>
+              <label>Jumlah:</label>
+              <input
+                type="number"
+                className="form-control"
+                min="1"
+                step="1"
+                required
+                value={inputQty}
+                onChange={(e) => setInputQty(e.target.value)}
+              />
+            </div>
+            <div className="form-group" style={{ flex: '1 1 190px' }}>
+              <label>Total Harga Beli (Nota):</label>
               <div className="input-group">
                 <span className="input-group-addon">Rp</span>
-                <input 
-                  type="number" 
+                <NominalInput
                   className="form-control"
-                  value={inputBuyPrice}
-                  onChange={(e) => setInputBuyPrice(e.target.value)}
+                  required
+                  value={purchaseTotal}
+                  onValueChange={setPurchaseTotal}
                 />
               </div>
             </div>
-            <div style={{ flex: '0 0 150px' }}>
-              <label className="form-group" style={{ fontWeight: 'bold' }}>Simpan Ke:</label>
-
-              <select 
-                className="form-control"
-                value={targetLocation}
-                onChange={(e) => setTargetLocation(e.target.value)}
-              >
-                <option value="Rumah">Stok Rumah</option>
-                <option value="Pasar">Stok Pasar</option>
-              </select>
-            </div>
-            <div style={{ flex: '0 0 100px', display: 'flex', alignItems: 'flex-end' }}>
-              <button 
-                type="button" 
-                className="btn btn-primary" 
-                style={{ width: '100%', padding: '10px' }} 
-                onClick={handleAddItemToBill}
-              >
-                Tambah
-              </button>
-            </div>
           </div>
 
-          <div className="table-responsive" style={{ marginTop: '20px' }}>
-            <table>
-              <thead>
-                <tr>
-                  <th>Nama Produk</th>
-                  <th>Harga Beli</th>
-                  <th>Kuantitas</th>
-                  <th>Tujuan Stok</th>
-                  <th>Subtotal</th>
-                  <th>Aksi</th>
-                </tr>
-              </thead>
-              <tbody>
-                {purchaseItems.length === 0 ? (
-                  <tr>
-                    <td colSpan="6" style={{ textAlign: 'center', color: 'var(--text-muted)', padding: '24px' }}>
-                      Belum ada barang di daftar nota ini. Masukkan di atas.
-                    </td>
-                  </tr>
-                ) : (
-                  purchaseItems.map((item, idx) => (
-                    <tr key={idx}>
-                      <td style={{ fontWeight: '600' }}>{item.nama_produk}</td>
-                      <td>{formatRupiah(item.harga_beli)}</td>
-                      <td>{item.jumlah} pcs</td>
-                      <td>
-                        <span className={`badge ${item.lokasi_tujuan === 'Pasar' ? 'badge-success' : 'badge-info'}`}>
-                          Stok {item.lokasi_tujuan}
-                        </span>
-                      </td>
-                      <td style={{ fontWeight: '600' }}>{formatRupiah(item.harga_beli * item.jumlah)}</td>
-                      <td>
-                        <button className="btn btn-secondary btn-sm" style={{ color: 'var(--color-danger)' }} onClick={() => handleRemoveFromBill(idx)}>
-                          Batalkan
-                        </button>
-                      </td>
-                    </tr>
-                  ))
-                )}
-              </tbody>
-            </table>
-          </div>
-        </div>
-      </div>
-
-      {/* Ringkasan Nota & Upload Foto (Kanan) */}
-      <form onSubmit={handleSavePurchase} className="pos-cart no-print" style={{ height: 'auto', position: 'static' }}>
-        <div className="panel-header" style={{ backgroundColor: 'var(--bg-tertiary)' }}>
-          <span className="panel-title">Informasi Nota Nyambut Barang</span>
-        </div>
-        <div className="panel-body">
-          <div className="form-group">
-            <label>Nama Supplier / Toko Besar:</label>
-            <input 
-              type="text" 
-              className="form-control" 
-              required
-              placeholder="misal: Toko Berkah Elektro, CV Jaya"
-              value={supplierName}
-              onChange={(e) => setSupplierName(e.target.value)}
-            />
+          <div style={{ margin: '0 0 18px', padding: '12px 14px', borderRadius: '8px', background: 'var(--bg-tertiary)', display: 'flex', justifyContent: 'space-between', gap: '12px', flexWrap: 'wrap' }}>
+            <span>{matchedProduct ? `Stok fisik ${matchedProduct.nama} saat ini: ${Number(matchedProduct.stok_rumah) + Number(matchedProduct.stok_pasar) + Number(matchedProduct.stok_belum_dialokasikan || 0)} pcs` : 'Produk baru akan dibuat otomatis dari transaksi ini.'}</span>
+            <span>Belum dialokasikan setelah diterima: <strong>{(Number(matchedProduct?.stok_belum_dialokasikan) || 0) + (Number(inputQty) || 0)} pcs</strong></span>
+            <span>Nilai pembelian: <strong>{formatRupiah(totalNota)}</strong></span>
           </div>
 
-          <div className="form-group">
-            <label>Status Pembayaran Ke Supplier:</label>
-            <div style={{ display: 'flex', gap: '8px' }}>
-              <button
-                type="button"
-                className={`btn btn-secondary ${purchaseStatus === 'Lunas' ? 'btn-primary' : ''}`}
-                style={{ flex: 1, padding: '8px' }}
-                onClick={() => setPurchaseStatus('Lunas')}
-              >
-                Lunas
-              </button>
-              <button
-                type="button"
-                className={`btn btn-secondary ${purchaseStatus === 'Tempo' ? 'btn-danger' : ''}`}
-                style={{ flex: 1, padding: '8px' }}
-                onClick={() => setPurchaseStatus('Tempo')}
-              >
-                Tempo (Hutang)
-              </button>
-            </div>
-          </div>
-
-          {/* INPUT FOTO NOTA PEMBELIAN */}
-          <div className="form-group" style={{ marginTop: '16px' }}>
-            <label style={{ display: 'flex', alignItems: 'center', gap: '6px' }}>
-              <Camera size={16} /> Foto Nota Fisik (Opsional):
-            </label>
-            <input 
-              type="file" 
-              accept="image/*"
-              className="form-control" 
-              onChange={handleFileChange}
-              style={{ fontSize: '0.8rem', padding: '6px 12px' }}
-            />
-            {previewFileUrl && (
-              <div style={{ marginTop: '10px', position: 'relative', border: '1px solid var(--border-color)', borderRadius: '8px', overflow: 'hidden', height: '100px', display: 'flex', alignItems: 'center', justifyContent: 'center' }}>
-                <img src={previewFileUrl} alt="Preview Nota" style={{ maxHeight: '100%', maxWidth: '100%', objectFit: 'contain' }} />
-                <button 
-                  type="button" 
-                  className="btn btn-danger btn-sm"
-                  style={{ position: 'absolute', top: '5px', right: '5px', padding: '2px 6px', fontSize: '0.7rem' }}
-                  onClick={() => {
-                    setNotaFileBase64('');
-                    setPreviewFileUrl('');
-                  }}
+          <div className="form-row" style={{ alignItems: 'center' }}>
+            <div className="form-group" style={{ flex: '1 1 220px', marginBottom: 0 }}>
+              <label>Status pembayaran supplier:</label>
+              <div style={{ display: 'flex', gap: '8px' }}>
+                <button
+                  type="button"
+                  className={`btn btn-secondary ${purchaseStatus === 'Lunas' ? 'btn-primary' : ''}`}
+                  style={{ flex: 1, padding: '8px' }}
+                  onClick={() => setPurchaseStatus('Lunas')}
                 >
-                  Hapus
+                  Lunas
+                </button>
+                <button
+                  type="button"
+                  className={`btn btn-secondary ${purchaseStatus === 'Tempo' ? 'btn-danger' : ''}`}
+                  style={{ flex: 1, padding: '8px' }}
+                  onClick={() => setPurchaseStatus('Tempo')}
+                >
+                  Tempo
                 </button>
               </div>
-            )}
-          </div>
-
-          <div style={{ margin: '24px 0', borderTop: '1px solid var(--border-color)', paddingTop: '16px' }}>
-            <div style={{ display: 'flex', justifyContent: 'space-between', fontSize: '0.9rem', marginBottom: '8px' }}>
-              <span>Total Item Nyambut:</span>
-              <strong style={{ color: 'var(--text-main)' }}>{purchaseItems.reduce((sum, i) => sum + i.jumlah, 0)} pcs</strong>
             </div>
-            <div style={{ display: 'flex', justifyContent: 'space-between', fontSize: '1.25rem', fontWeight: 'bold' }}>
-              <span>TOTAL NOTA:</span>
-              <span style={{ color: 'var(--accent)' }}>{formatRupiah(totalNota)}</span>
+            <div className="form-group" style={{ flex: '1 1 240px', marginBottom: 0, alignSelf: 'flex-end' }}>
+              <button type="submit" className="btn btn-primary" disabled={isSaving} style={{ width: '100%', minHeight: '42px' }}>
+                {isSaving ? 'Menyimpan Pembelian...' : 'Simpan Pembelian & Terima Stok'}
+              </button>
             </div>
           </div>
-
-          <button type="submit" className="btn btn-primary" style={{ width: '100%', padding: '12px' }}>
-            Simpan & Tambah Stok
-          </button>
         </div>
       </form>
 
-      {/* Riwayat Nota Nyambut Barang */}
-      <div className="panel-card no-print grid-span-2" style={{ marginTop: '24px' }}>
+      {/* Riwayat Pembelian Barang */}
+      <div className="panel-card no-print purchase-history" style={{ marginTop: '24px' }}>
         <div className="panel-header">
-          <span className="panel-title">Riwayat Nyambut Barang Terakhir</span>
+          <span className="panel-title">Riwayat Pembelian Barang</span>
         </div>
         <div className="panel-body" style={{ padding: 0 }}>
           {purchases.length === 0 ? (
-            <p style={{ padding: '24px', color: 'var(--text-muted)', fontSize: '0.9rem' }}>Belum ada riwayat nyambut barang dicatat.</p>
+            <p style={{ padding: '24px', color: 'var(--text-muted)', fontSize: '0.9rem' }}>Belum ada riwayat pembelian barang.</p>
           ) : (
             <div className="table-responsive">
               <table>
@@ -3196,7 +3091,7 @@ function PurchasesView({ products, purchases, formatRupiah, fetchData, setActive
                   <tr>
                     <th>Tanggal</th>
                     <th>Supplier</th>
-                    <th>Detail Barang yang Disambut</th>
+                    <th>Detail Barang yang Dibeli</th>
                     <th>Total Nota</th>
                     <th>Status</th>
                     <th>Foto Nota</th>
@@ -3208,7 +3103,12 @@ function PurchasesView({ products, purchases, formatRupiah, fetchData, setActive
                       <td style={{ fontSize: '0.85rem' }}>
                         {new Date(p.tanggal).toLocaleDateString('id-ID', { dateStyle: 'medium' })}
                       </td>
-                      <td style={{ fontWeight: 'bold' }}>{p.nama_supplier}</td>
+                      <td style={{ fontWeight: 'bold' }}>
+                        {p.nama_supplier}
+                        {p.sumber_data === 'Simulasi otomatis (DEMO)' && (
+                          <span className="badge badge-warning" style={{ marginLeft: '6px', fontSize: '0.68rem' }}>DEMO</span>
+                        )}
+                      </td>
                       <td style={{ fontSize: '0.85rem', maxWidth: '300px', whiteSpace: 'nowrap', overflow: 'hidden', textOverflow: 'ellipsis' }}>
                         {p.items?.map(i => `${i.nama_produk} (${i.jumlah} pcs)`).join(', ')}
                       </td>
@@ -3258,88 +3158,6 @@ function PurchasesView({ products, purchases, formatRupiah, fetchData, setActive
         </div>
       )}
 
-      {/* Modal Shortcut Tambah Barang Baru */}
-      {showAddProductShortcut && (
-        <div className="modal-overlay">
-          <div className="modal-container" style={{ maxWidth: '450px' }}>
-            <div className="modal-header">
-              <span className="modal-title">Daftarkan Produk Baru ke Katalog</span>
-              <button className="btn-icon-only btn-sm" onClick={() => setShowAddProductShortcut(false)}>X</button>
-            </div>
-            <form onSubmit={handleSaveProductShortcut}>
-              <div className="modal-body">
-                <p style={{ fontSize: '0.8rem', color: 'var(--text-muted)', marginBottom: '16px' }}>
-                  Gunakan form ini untuk mendaftarkan nama produk yang belum pernah ada di sistem. Setelah disimpan, produk akan otomatis terpilih di menu input Nota.
-                </p>
-                <div className="form-group">
-                  <label>Nama Barang:</label>
-                  <input 
-                    type="text" 
-                    required 
-                    className="form-control" 
-                    placeholder="misal: Kabel Eterna 2x1.5 NYM"
-                    value={newProdFormData.nama}
-                    onChange={(e) => setNewProdFormData({ ...newProdFormData, nama: e.target.value })}
-                  />
-                </div>
-                <div className="form-group">
-                  <label>Jenis (Kategori):</label>
-                  <input 
-                    type="text" 
-                    required 
-                    className="form-control" 
-                    placeholder="misal: Kabel, Saklar, Lampu"
-                    value={newProdFormData.kategori}
-                    onChange={(e) => setNewProdFormData({ ...newProdFormData, kategori: e.target.value })}
-                  />
-                </div>
-                <div className="form-row">
-                  <div className="form-group">
-                    <label>Harga Beli Default (Modal):</label>
-                    <div className="input-group">
-                      <span className="input-group-addon">Rp</span>
-                      <input 
-                        type="number" 
-                        required 
-                        className="form-control"
-                        value={newProdFormData.harga_beli_default}
-                        onChange={(e) => setNewProdFormData({ ...newProdFormData, harga_beli_default: e.target.value })}
-                      />
-                    </div>
-                  </div>
-                  <div className="form-group">
-                    <label>Harga Jual Default:</label>
-                    <div className="input-group">
-                      <span className="input-group-addon">Rp</span>
-                      <input 
-                        type="number" 
-                        required 
-                        className="form-control"
-                        value={newProdFormData.harga_jual_default}
-                        onChange={(e) => setNewProdFormData({ ...newProdFormData, harga_jual_default: e.target.value })}
-                      />
-                    </div>
-                  </div>
-                </div>
-                <div className="form-group">
-                  <label>Batas Minim Stok Alert (Peringatan):</label>
-                  <input 
-                    type="number" 
-                    required 
-                    className="form-control"
-                    value={newProdFormData.stok_minimum}
-                    onChange={(e) => setNewProdFormData({ ...newProdFormData, stok_minimum: Number(e.target.value) })}
-                  />
-                </div>
-              </div>
-              <div className="modal-footer">
-                <button type="button" className="btn btn-secondary" onClick={() => setShowAddProductShortcut(false)}>Batal</button>
-                <button type="submit" className="btn btn-primary">Daftarkan & Pilih</button>
-              </div>
-            </form>
-          </div>
-        </div>
-      )}
     </div>
   );
 }
@@ -3347,36 +3165,52 @@ function PurchasesView({ products, purchases, formatRupiah, fetchData, setActive
 // ----------------------------------------------------------------------------------
 // SUB-VIEW: PENGELUARAN OPERASIONAL
 // ----------------------------------------------------------------------------------
-function ExpensesView({ expenses, formatRupiah, fetchData, showToast, showConfirm }) {
+function ExpensesView({ expenses, formatRupiah, fetchData, showToast, showConfirm, requestWriteAccess }) {
+  const [searchQuery, setSearchQuery] = useState('');
   const [formData, setFormData] = useState({
     kategori: 'Transport',
     jumlah: '',
     keterangan: ''
   });
+  const filteredExpenses = expenses.filter(expense => {
+    const query = searchQuery.trim().toLocaleLowerCase('id-ID');
+    if (!query) return true;
+    const searchableValues = [
+      expense.kategori,
+      expense.keterangan,
+      expense.tanggal,
+      new Date(expense.tanggal).toLocaleString('id-ID'),
+      expense.jumlah,
+      formatRupiah(expense.jumlah)
+    ];
+    return searchableValues.some(value => String(value || '').toLocaleLowerCase('id-ID').includes(query));
+  });
 
   const handleSubmit = async (e) => {
     e.preventDefault();
-    const cleanJumlah = Number(formData.jumlah) || 0;
+    const cleanJumlah = parseNominal(formData.jumlah);
     if (cleanJumlah <= 0) {
       showToast('Jumlah pengeluaran harus lebih dari Rp 0!', 'error');
       return;
     }
 
-    try {
-      await dbService.addExpense({
-        ...formData,
-        jumlah: cleanJumlah
-      });
-      setFormData({
-        kategori: 'Transport',
-        jumlah: '',
-        keterangan: ''
-      });
-      showToast('Biaya operasional toko berhasil dicatat!', 'success');
-      fetchData();
-    } catch (err) {
-      showToast('Gagal menyimpan biaya operasional.', 'error');
-    }
+    requestWriteAccess(async () => {
+      try {
+        await dbService.addExpense({
+          ...formData,
+          jumlah: cleanJumlah
+        });
+        setFormData({
+          kategori: 'Transport',
+          jumlah: '',
+          keterangan: ''
+        });
+        showToast('Biaya operasional toko berhasil dicatat!', 'success');
+        fetchData();
+      } catch (err) {
+        showToast('Gagal menyimpan biaya operasional.', 'error');
+      }
+    });
   };
 
   return (
@@ -3387,6 +3221,20 @@ function ExpensesView({ expenses, formatRupiah, fetchData, showToast, showConfir
           <span className="panel-title">Riwayat Pengeluaran Operasional</span>
         </div>
         <div className="panel-body" style={{ padding: 0 }}>
+          <div style={{ padding: '12px 16px', borderBottom: '1px solid var(--border-color)' }}>
+            <div style={{ position: 'relative' }}>
+              <Search size={17} aria-hidden="true" style={{ position: 'absolute', left: '12px', top: '50%', transform: 'translateY(-50%)', color: 'var(--text-muted)' }} />
+              <input
+                type="search"
+                className="form-control"
+                aria-label="Cari riwayat pengeluaran"
+                placeholder="Cari kategori, keterangan, tanggal, atau nominal..."
+                value={searchQuery}
+                onChange={(event) => setSearchQuery(event.target.value)}
+                style={{ paddingLeft: '38px' }}
+              />
+            </div>
+          </div>
           {/* Fix #8: Ringkasan total pengeluaran per kategori */}
           {expenses.length > 0 && (
             <div style={{ padding: '12px 16px', display: 'flex', gap: '12px', flexWrap: 'wrap', borderBottom: '1px solid var(--border-color)', backgroundColor: 'var(--bg-tertiary)' }}>
@@ -3404,6 +3252,8 @@ function ExpensesView({ expenses, formatRupiah, fetchData, showToast, showConfir
           )}
           {expenses.length === 0 ? (
             <p style={{ padding: '24px', color: 'var(--text-muted)', fontSize: '0.9rem' }}>Belum ada pencatatan biaya operasional.</p>
+          ) : filteredExpenses.length === 0 ? (
+            <p style={{ padding: '24px', color: 'var(--text-muted)', fontSize: '0.9rem', textAlign: 'center' }}>Tidak ada pengeluaran yang cocok dengan pencarian.</p>
           ) : (
             <div className="table-responsive">
               <table>
@@ -3417,7 +3267,7 @@ function ExpensesView({ expenses, formatRupiah, fetchData, showToast, showConfir
                   </tr>
                 </thead>
                 <tbody>
-                  {expenses.map(e => (
+                  {filteredExpenses.map(e => (
                     <tr key={e.id}>
                       <td style={{ fontSize: '0.85rem' }}>
                         {new Date(e.tanggal).toLocaleString('id-ID', { dateStyle: 'medium' })}
@@ -3426,13 +3276,18 @@ function ExpensesView({ expenses, formatRupiah, fetchData, showToast, showConfir
                         <span className="badge badge-warning">{e.kategori}</span>
                       </td>
                       <td style={{ fontWeight: '600', color: 'var(--color-danger)' }}>{formatRupiah(e.jumlah)}</td>
-                      <td>{e.keterangan || '-'}</td>
+                      <td>
+                        {e.keterangan || '-'}
+                        {e.sumber_data === 'Simulasi otomatis (DEMO)' && (
+                          <span className="badge badge-warning" style={{ marginLeft: '6px', fontSize: '0.68rem' }}>DEMO</span>
+                        )}
+                      </td>
                       {/* Fix #3: Tombol hapus pengeluaran */}
                       <td className="no-print">
                         <button
                           className="btn btn-danger btn-sm"
                           style={{ padding: '4px 8px' }}
-                          onClick={() => showConfirm(`Hapus pengeluaran ${e.kategori} sebesar ${formatRupiah(e.jumlah)}?`, async () => {
+                          onClick={() => requestWriteAccess(() => showConfirm(`Hapus pengeluaran ${e.kategori} sebesar ${formatRupiah(e.jumlah)}?`, async () => {
                             try {
                               await dbService.deleteExpense(e.id);
                               showToast('Pengeluaran berhasil dihapus.', 'success');
@@ -3440,7 +3295,7 @@ function ExpensesView({ expenses, formatRupiah, fetchData, showToast, showConfir
                             } catch (err) {
                               showToast('Gagal menghapus pengeluaran.', 'error');
                             }
-                          })}
+                          }))}
                         >
                           <Trash2 size={13} />
                         </button>
@@ -3480,12 +3335,11 @@ function ExpensesView({ expenses, formatRupiah, fetchData, showToast, showConfir
             <label>Nominal Pengeluaran:</label>
             <div className="input-group">
               <span className="input-group-addon">Rp</span>
-              <input 
-                type="number" 
+              <NominalInput
                 required
                 className="form-control" 
                 value={formData.jumlah}
-                onChange={(e) => setFormData({ ...formData, jumlah: e.target.value })}
+                onValueChange={(value) => setFormData({ ...formData, jumlah: value })}
               />
             </div>
           </div>
