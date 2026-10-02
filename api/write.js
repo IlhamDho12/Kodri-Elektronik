@@ -1,5 +1,5 @@
 import { createHmac, randomBytes, timingSafeEqual } from 'node:crypto';
-import { isMock, dbService, supabase } from '../server/db.js';
+import { isMock, dbService, db, registerWriteAttempt } from '../server/db.js';
 
 const TOKEN_TTL_MS = 8 * 60 * 60 * 1000;
 const PIN_ACTIONS = new Set([
@@ -123,8 +123,8 @@ export default async function handler(req, res) {
   }
 
   try {
-    if (isMock || !supabase) {
-      return json(res, 503, { error: 'Konfigurasi Supabase server belum lengkap.' });
+    if (isMock || !db) {
+      return json(res, 503, { error: 'Konfigurasi Firebase server belum lengkap.' });
     }
     const expectedCode = process.env.WRITE_ACCESS_CODE || '';
     const signingSecret = getSigningSecret();
@@ -136,14 +136,10 @@ export default async function handler(req, res) {
     }
 
     if (body.action === 'unlock') {
-      const { data: allowed, error } = await supabase.rpc('register_write_access_attempt', {
-        p_ip_hash: getClientIpHash(req, signingSecret),
-        p_success: isCorrectCode(body.code, expectedCode)
-      });
-      if (error) {
-        console.error('Gagal memeriksa batas percobaan kode akses:', error);
-        return json(res, 503, { error: 'Perlindungan kode belum siap. Terapkan migrasi Supabase terlebih dahulu.' });
-      }
+      const allowed = await registerWriteAttempt(
+        getClientIpHash(req, signingSecret),
+        isCorrectCode(body.code, expectedCode)
+      );
       if (allowed !== true) return json(res, 429, { error: 'Terlalu banyak percobaan. Coba kembali setelah 15 menit.' });
       if (!isCorrectCode(body.code, expectedCode)) return json(res, 401, { error: 'Kode akses salah. Silakan coba lagi.' });
 

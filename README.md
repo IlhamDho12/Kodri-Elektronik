@@ -23,13 +23,13 @@ Aplikasi berbasis web responsif (mobile & desktop) yang dirancang khusus untuk m
 * **Frontend**: React.js, Vite, Vanilla CSS (Sleek Dark/Light theme).
 * **Database (Dual Mode)**:
   * **Local Mode (Default)**: Menggunakan LocalStorage browser Anda. Siap pakai seketika tanpa konfigurasi apa pun untuk demonstrasi awal.
-  * **Cloud Mode (Rekomendasi)**: Data disimpan di **Supabase (PostgreSQL)** dan tersinkronisasi antarperangkat. Pengunjung boleh membaca data; perubahan hanya dapat dilakukan melalui API server setelah kode akses diverifikasi.
+  * **Cloud Mode (Rekomendasi)**: Data disimpan di **Firebase Cloud Firestore** dan tersinkronisasi antarperangkat. Pengunjung boleh membaca data melalui API situs; perubahan hanya dapat dilakukan melalui API server setelah kode akses diverifikasi.
 
 ### Otomasi Data Demo Harian
 
 Saat berjalan di Local Mode dan sudah memiliki riwayat, aplikasi membuat data **simulasi DEMO** satu kali pada pembukaan pertama setiap tanggal di browser tersebut. Jumlah penjualan mengikuti pola hari yang sama dari riwayat; transaksi pasar hanya dibuat Senin, Selasa, Rabu, Sabtu, dan Minggu dengan nama kalangan yang sesuai. Empat hari pertama Syawal tidak membuat transaksi pasar. Pada Kamis/Jumat, bila tidak ada nota pembelian yang tercatat pada hari tersebut, generator dapat meniru satu nota pembelian dari hari yang sama pada riwayat (total harus Rp1 juta hingga kurang dari Rp15 juta), memakai supplier dan produk yang ada, lalu menambah kuantitas ke **Belum Dialokasikan** agar alur distribusi stok tetap digunakan. Generator juga dapat meniru satu pengeluaran harian bila belum ada pengeluaran pada tanggal itu. Semua data simulasi memakai stok/katalog lokal yang tersedia dan ditandai `DEMO` serta kolom **Sumber data** pada backup Excel. Jika sudah ada penjualan/pembelian/pengeluaran pada tanggal itu atau riwayat/stok yang cocok tidak tersedia, generator tidak menambah data pada bagian tersebut.
 
-Otomasi ini hanya berjalan di browser saat aplikasi dibuka, tidak berjalan ketika browser ditutup, dan tidak pernah menulis ke Supabase. Data yang dibuat adalah simulasi untuk portfolio/latihan, bukan bukti penjualan atau catatan pembukuan nyata. Jika generator melewati hari karena stok atau riwayat tidak tersedia, perbaiki datanya lalu hapus marker terkait di Local Storage: `kodri_demo_automation_last_run`, `kodri_demo_automation_last_run_purchase`, atau `kodri_demo_automation_last_run_expense`; data yang sudah ada pada tanggal itu tetap mencegah duplikasi. Untuk mematikan otomasi permanen, nonaktifkan pemanggilan `runDailyDemoAutomation` di `src/App.jsx`.
+Otomasi ini hanya berjalan di browser saat aplikasi dibuka, tidak berjalan ketika browser ditutup, dan tidak pernah menulis data DEMO ke Firestore. Data yang dibuat adalah simulasi untuk portfolio/latihan, bukan bukti penjualan atau catatan pembukuan nyata. Jika generator melewati hari karena stok atau riwayat tidak tersedia, perbaiki datanya lalu hapus marker terkait di Local Storage: `kodri_demo_automation_last_run`, `kodri_demo_automation_last_run_purchase`, atau `kodri_demo_automation_last_run_expense`; data yang sudah ada pada tanggal itu tetap mencegah duplikasi. Untuk mematikan otomasi permanen, nonaktifkan pemanggilan `runDailyDemoAutomation` di `src/App.jsx`.
 
 ### Deploy ke Vercel
 
@@ -42,14 +42,15 @@ npx vercel
 
 Atur environment variables berikut di **Vercel Project → Settings → Environment Variables** untuk Production, lalu redeploy:
 
-* `VITE_SUPABASE_URL` dan `VITE_SUPABASE_ANON_KEY`: dipakai browser untuk membaca data.
-* `SUPABASE_URL` dan `SUPABASE_SERVICE_ROLE_KEY`: dipakai hanya oleh API server untuk menulis. Jangan gunakan awalan `VITE_` dan jangan pernah memasukkan service-role key ke source code.
+* `FIREBASE_PROJECT_ID`, `FIREBASE_CLIENT_EMAIL`, dan `FIREBASE_PRIVATE_KEY`: kredensial service account Firebase, dipakai hanya oleh API server. Jangan gunakan awalan `VITE_` dan jangan pernah memasukkan private key ke source code.
 * `WRITE_ACCESS_CODE`: kode edit (misalnya `7768`).
 * `WRITE_ACCESS_TOKEN_SECRET`: secret acak minimal 32 karakter untuk menandatangani sesi edit.
 
-Tidak ada halaman login awal. Pengunjung dapat membaca data; saat mencoba mengubah data, aplikasi meminta kode. Server membatasi percobaan kode dan menerbitkan sesi edit selama 8 jam. Kode tidak dimasukkan ke bundle browser.
+Tidak ada halaman login awal. Pengunjung dapat membaca data melalui endpoint publik situs; saat mencoba mengubah data, aplikasi meminta kode. Server membatasi percobaan kode dan menerbitkan sesi edit selama 8 jam. Kode dan kredensial Firebase tidak dimasukkan ke bundle browser. Jangan simpan data pribadi yang tidak ingin terlihat publik.
 
-**Penting:** kebijakan Supabase memberi akses baca kepada role anonim, sehingga semua isi tabel aplikasi dapat dibaca lewat situs maupun API Supabase oleh siapa pun. Jangan simpan data pribadi atau informasi yang tidak ingin dipublikasikan; hapus/samarkan data tersebut sebelum membuka pembacaan publik.
+Buat secret sesi di PowerShell dengan `node -e "console.log(require('crypto').randomBytes(32).toString('hex'))"`, lalu tempel hasilnya langsung ke Vercel tanpa membagikannya.
+
+**Penting:** endpoint baca Firestore pada situs bersifat publik, jadi semua isi koleksi aplikasi dapat dibaca siapa pun. Jangan simpan data pribadi atau informasi yang tidak ingin dipublikasikan.
 
 ---
 
@@ -66,21 +67,27 @@ Tidak ada halaman login awal. Pengunjung dapat membaca data; saat mencoba mengub
    ```
 4. Buka tautan lokal yang muncul (biasanya `http://localhost:5173`) di browser komputer atau browser HP Anda.
 
-Local Mode dapat digunakan langsung. Untuk menguji penulisan ke Supabase melalui API Vercel secara lokal, gunakan `vercel dev` setelah menyiapkan environment variables server-only.
+Local Mode dapat digunakan langsung dengan `npm run dev`. Untuk menguji Firestore melalui API Vercel secara lokal, gunakan `vercel dev` setelah menyiapkan environment variables server-only.
 
----
+## Menyiapkan Firebase Firestore
 
-## Menyiapkan Supabase yang sudah ada
+1. Buat atau pilih project di [Firebase Console](https://console.firebase.google.com/).
+2. Buka **Build → Firestore Database → Create database**. Pilih **Production mode** dan lokasi database dengan hati-hati; lokasinya tidak dapat diubah setelah dibuat.
+3. Buka **Project settings → Service accounts → Generate new private key**. Unduh JSON ke komputer pribadi dan jangan commit atau kirim file ini.
+4. Tambahkan Environment Variables berikut di Vercel Production dengan nilai dari service-account JSON:
+   * `FIREBASE_PROJECT_ID` ← `project_id`
+   * `FIREBASE_CLIENT_EMAIL` ← `client_email`
+   * `FIREBASE_PRIVATE_KEY` ← `private_key` (isi lengkap termasuk header/footer PEM; Vercel dapat menyimpan baris baru atau teks `\n`)
+   * `WRITE_ACCESS_CODE` ← kode edit yang dipilih
+   * `WRITE_ACCESS_TOKEN_SECRET` ← secret acak minimal 32 karakter.
+5. Terapkan aturan [firestore.rules](./firestore.rules) di **Firestore → Rules**. Browser tidak membaca Firestore secara langsung; data publik dilayani oleh API Vercel, sedangkan API admin menulis ke Firestore.
+6. Deploy branch `main` ke Vercel setelah environment variables tersimpan.
 
-Sebelum deploy, unduh backup Excel dari aplikasi dan jalankan [supabase_public_read_server_write.sql](./supabase_public_read_server_write.sql) satu kali melalui **Supabase → SQL Editor**. Migrasi menambahkan kolom yang diperlukan clone, mengizinkan pembacaan publik, menolak penulisan langsung oleh `anon` maupun `authenticated`, dan menyiapkan pembatasan percobaan kode. Penulisan aplikasi kemudian dilakukan oleh API Vercel menggunakan service-role key yang disimpan sebagai environment variable server-only.
-
-Untuk membuat `WRITE_ACCESS_TOKEN_SECRET`, jalankan `node --input-type=module -e "import crypto from 'node:crypto'; console.log(crypto.randomBytes(32).toString('hex'))"` lalu simpan output hanya di environment Vercel.
-
-Untuk database Supabase baru, jalankan [supabase_schema.sql](./supabase_schema.sql). Jangan jalankan schema awal pada database yang sudah berisi data; gunakan migrasi di atas agar tabel dan data lama tetap dipertahankan.
+Database Firestore baru mulai kosong. Data Supabase lama tidak disalin. Koleksi (`produk`, `transaksi`, `pembelian`, `pengeluaran`) dan dokumen dibuat otomatis ketika data pertama disimpan.
 
 ## Backup dan Pemulihan Excel
 
-Gunakan panel utilitas di bagian bawah Dashboard untuk mengunduh backup `.xlsx` atau memulihkan data dari workbook backup aplikasi. Workbook berisi sheet produk, transaksi dan rinciannya, pembelian dan rinciannya, pengeluaran, serta lampiran. Saat pemulihan, aplikasi akan mengganti seluruh data pada mode penyimpanan aktif (Local Mode atau Supabase); periksa file dan pastikan data saat ini sudah di-backup sebelum menyetujui.
+Gunakan panel utilitas di bagian bawah Dashboard untuk mengunduh backup `.xlsx` atau memulihkan data dari workbook backup aplikasi. Workbook berisi sheet produk, transaksi dan rinciannya, pembelian dan rinciannya, pengeluaran, serta lampiran. Saat pemulihan, aplikasi akan mengganti seluruh data pada mode penyimpanan aktif (Local Mode atau Firestore); periksa file dan pastikan data saat ini sudah di-backup sebelum menyetujui.
 
 ## Struktur Proyek
 
@@ -88,7 +95,8 @@ Gunakan panel utilitas di bagian bawah Dashboard untuk mengunduh backup `.xlsx` 
 * `src/main.jsx`: Entry point React.
 * `src/App.jsx`: Logika navigasi tab, antarmuka kasir, form nota, pengeluaran, dan dashboard keuangan.
 * `src/index.css`: Sistem desain UI, tema gelap/terang, layout responsif.
-* `src/services/db.js`: Service layer yang mengatur pembacaan & penulisan data ke database (Supabase/LocalStorage).
+* `src/services/db.js`: Service layer pembacaan API dan penulisan terlindungi (Firestore/LocalStorage).
 * `src/services/excelBackup.js`: Ekspor dan validasi workbook Excel untuk backup/pemulihan.
-* `supabase_schema.sql`: Kumpulan query SQL untuk setup database Supabase.
+* `server/db.js`: Adapter Firebase Admin untuk Firestore.
+* `firestore.rules`: Menolak akses langsung browser ke Firestore; API Vercel memakai Firebase Admin.
 * `.env.example`: Template browser dan server environment variables; semua nilai rahasia harus diisi melalui environment lokal/Vercel dan tidak di-commit.

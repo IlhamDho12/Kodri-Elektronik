@@ -255,7 +255,7 @@ function App() {
       setExpenses(exp);
     } catch (err) {
       console.error(err);
-      showToast('Gagal mengambil data dari database.', 'error');
+      showToast(`Gagal mengambil data dari database: ${err instanceof Error ? err.message : 'periksa konfigurasi koneksi.'}`, 'error');
       if (throwOnError) throw err;
     } finally {
       if (showLoading) setLoading(false);
@@ -451,7 +451,7 @@ function App() {
         <div className="sidebar-footer">
           <div style={{ display: 'flex', flexDirection: 'column', gap: '8px', width: '100%' }}>
             <span style={{ fontSize: '0.75rem', color: 'var(--text-muted)', display: 'block' }}>
-              {isMock ? '🔴 Demo (Lokal HP/PC)' : '🟢 Cloud Supabase Aktif'}
+              {isMock ? '🔴 Demo (Lokal HP/PC)' : '🟢 Cloud Firestore Aktif'}
             </span>
             <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center' }}>
               <button className="btn-icon-only" onClick={toggleTheme} aria-label="Toggle Theme">
@@ -493,7 +493,7 @@ function App() {
           <div className="alert-banner alert-info-banner no-print">
             <Database size={18} />
             <div>
-              <strong>Mode demo:</strong> Data hanya tersimpan di browser ini. Hubungkan Supabase melalui file <code>.env</code> untuk sinkronisasi antar perangkat.
+              <strong>Mode demo:</strong> Data hanya tersimpan di browser ini. Siapkan Firebase Admin di Vercel untuk sinkronisasi antar perangkat.
             </div>
           </div>
         )}
@@ -2677,7 +2677,7 @@ function ProductsView({ products, formatRupiah, fetchData, showToast, showConfir
         fetchData();
       } catch (err) {
         console.error('Gagal menyimpan penyesuaian produk:', err);
-        showToast(`Gagal menyimpan penyesuaian: ${err.message || 'cek koneksi Supabase'}`, 'error');
+        showToast(`Gagal menyimpan penyesuaian: ${err.message || 'cek koneksi Firestore'}`, 'error');
       }
     });
   };

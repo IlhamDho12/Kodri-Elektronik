@@ -1,384 +1,152 @@
-import { createClient } from '@supabase/supabase-js';
+import { cert, getApps, initializeApp } from 'firebase-admin/app';
+import { getFirestore } from 'firebase-admin/firestore';
+import { randomUUID } from 'node:crypto';
 
-const supabaseUrl = process.env.SUPABASE_URL || '';
-const supabaseKey = process.env.SUPABASE_SERVICE_ROLE_KEY || '';
+const projectId = process.env.FIREBASE_PROJECT_ID || '';
+const clientEmail = process.env.FIREBASE_CLIENT_EMAIL || '';
+const privateKey = (process.env.FIREBASE_PRIVATE_KEY || '').replace(/\\n/g, '\n');
+const isConfigured = Boolean(projectId && clientEmail && privateKey);
 
-const isCloudConfigured = supabaseUrl.trim() !== '' && supabaseKey.trim() !== '';
+let firestore = null;
+if (isConfigured) {
+  const app = getApps()[0] || initializeApp({
+    credential: cert({ projectId, clientEmail, privateKey }),
+    projectId
+  });
+  firestore = getFirestore(app);
+}
 
-export const supabase = isCloudConfigured
-  ? createClient(supabaseUrl, supabaseKey, { auth: { autoRefreshToken: false, persistSession: false } })
-  : null;
-export const isMock = !isCloudConfigured;
-export const isCloud = isCloudConfigured;
+export const isMock = !isConfigured;
+export const db = firestore;
 
-// ----------------------------------------------------
-// DUMMY / INITIAL DATA UNTUK LOCAL STORAGE
-// ----------------------------------------------------
-const INITIAL_PRODUCTS = [];
-const INITIAL_PURCHASES = [];
-const INITIAL_TRANSACTIONS = [];
-const INITIAL_EXPENSES = [];
-
-// Helper untuk LocalStorage
-const getLocalData = (key, initial) => {
-  const data = localStorage.getItem(key);
-  if (!data) {
-    localStorage.setItem(key, JSON.stringify(initial));
-    return initial;
-  }
-  return JSON.parse(data);
+const COLLECTIONS = {
+  products: 'produk',
+  transactions: 'transaksi',
+  purchases: 'pembelian',
+  expenses: 'pengeluaran',
+  attempts: '_writeAccessAttempts'
 };
 
-const setLocalData = (key, data) => {
-  localStorage.setItem(key, JSON.stringify(data));
+const now = () => new Date().toISOString();
+const byNewest = (left, right) => String(right.tanggal || '').localeCompare(String(left.tanggal || ''));
+const asRecord = (snapshot) => ({ id: snapshot.id, ...snapshot.data() });
+const getAll = async (collection) => {
+  if (!db) return [];
+  const snapshot = await db.collection(collection).get();
+  return snapshot.docs.map(asRecord);
 };
 
-const insertRows = async (table, rows) => {
-  for (let index = 0; index < rows.length; index += 100) {
-    const { error } = await supabase.from(table).insert(rows.slice(index, index + 100));
-    if (error) throw error;
-  }
-};
-
-const deleteAllRows = async (table) => {
-  const { error } = await supabase.from(table).delete().not('id', 'is', null);
-  if (error) throw error;
-};
-
-const createUuid = () => {
-  if (typeof crypto.randomUUID === 'function') return crypto.randomUUID();
-
-  const bytes = crypto.getRandomValues(new Uint8Array(16));
-  bytes[6] = (bytes[6] & 0x0f) | 0x40;
-  bytes[8] = (bytes[8] & 0x3f) | 0x80;
-  const hex = Array.from(bytes, (byte) => byte.toString(16).padStart(2, '0')).join('');
-  return `${hex.slice(0, 8)}-${hex.slice(8, 12)}-${hex.slice(12, 16)}-${hex.slice(16, 20)}-${hex.slice(20)}`;
+const getProduct = async (id) => {
+  const snapshot = await db.collection(COLLECTIONS.products).doc(String(id)).get();
+  return snapshot.exists ? asRecord(snapshot) : null;
 };
 
 const normalizeProduct = (product) => {
+  if (!product || typeof product !== 'object') throw new Error('Data produk tidak valid.');
   const normalized = {
-    ...product,
     nama: String(product.nama || '').trim(),
     kategori: String(product.kategori || '').trim(),
     harga_beli_default: Number(product.harga_beli_default),
     stok_minimum: Number(product.stok_minimum),
     stok_rumah: Number(product.stok_rumah),
-    stok_pasar: Number(product.stok_pasar)
+    stok_pasar: Number(product.stok_pasar),
+    stok_belum_dialokasikan: Number(product.stok_belum_dialokasikan || 0)
   };
   if (!normalized.nama || !normalized.kategori) throw new Error('Nama dan kategori produk wajib diisi.');
   if (!Number.isFinite(normalized.harga_beli_default) || normalized.harga_beli_default < 0) {
     throw new Error('Harga modal harus berupa angka 0 atau lebih.');
   }
-  if (![normalized.stok_minimum, normalized.stok_rumah, normalized.stok_pasar].every((value) => Number.isInteger(value) && value >= 0)) {
+  if (![normalized.stok_minimum, normalized.stok_rumah, normalized.stok_pasar, normalized.stok_belum_dialokasikan]
+    .every((value) => Number.isInteger(value) && value >= 0)) {
     throw new Error('Stok dan batas minimum harus berupa bilangan bulat 0 atau lebih.');
   }
   return normalized;
 };
 
-// ----------------------------------------------------
-// IMPLEMENTASI DUAL SERVICE (MOCK & CLOUD)
-// ----------------------------------------------------
+const validateId = (id, label) => {
+  const value = String(id || '').trim();
+  if (!value || value.includes('/')) throw new Error(`${label} tidak valid.`);
+  return value;
+};
+
+const makeId = (prefix) => `${prefix}_${randomUUID()}`;
+const productsFromDb = async () => getAll(COLLECTIONS.products);
+
 export const dbService = {
-  async replaceAllData(backup) {
-    if (isMock) {
-      setLocalData('toko_produk', backup.products);
-      setLocalData('toko_transaksi', backup.transactions);
-      setLocalData('toko_pembelian', backup.purchases);
-      setLocalData('toko_pengeluaran', backup.expenses);
-      return;
-    }
-
-    const idMap = new Map();
-    const mapId = (value) => {
-      if (value === null || value === undefined || value === '') return null;
-      const id = String(value);
-      if (/^[\da-f]{8}-[\da-f]{4}-[1-8][\da-f]{3}-[89ab][\da-f]{3}-[\da-f]{12}$/i.test(id)) return id;
-      if (!idMap.has(id)) idMap.set(id, createUuid());
-      return idMap.get(id);
-    };
-
-    const products = backup.products.map((product) => ({
+  async getProducts() {
+    return (await productsFromDb()).map((product) => ({
       ...product,
-      id: mapId(product.id)
-    }));
-    const transactions = backup.transactions.map((transaction) => ({
-      ...transaction,
-      id: mapId(transaction.id),
-      items: transaction.items.map((item) => ({
-        ...item,
-        produk_id: mapId(item.produk_id)
-      }))
-    }));
-    const purchases = backup.purchases.map((purchase) => ({
-      ...purchase,
-      id: mapId(purchase.id),
-      items: purchase.items.map((item) => ({
-        ...item,
-        produk_id: mapId(item.produk_id)
-      }))
-    }));
-
-    await deleteAllRows('detail_transaksi');
-    await deleteAllRows('detail_pembelian');
-    await deleteAllRows('transaksi');
-    await deleteAllRows('pembelian_nota');
-    await deleteAllRows('stok_lokasi');
-    await deleteAllRows('pengeluaran');
-    await deleteAllRows('produk');
-
-    await insertRows('produk', products.map((product) => ({
-      id: product.id,
-      nama: product.nama,
-      kategori: product.kategori,
-      harga_beli_default: product.harga_beli_default,
-      stok_minimum: product.stok_minimum,
-      stok_belum_dialokasikan: Number(product.stok_belum_dialokasikan) || 0,
-      created_at: product.created_at || undefined
-    })));
-
-    const stocks = products.flatMap((product) => [
-      { produk_id: product.id, lokasi: 'Rumah', jumlah: Number(product.stok_rumah) || 0 },
-      { produk_id: product.id, lokasi: 'Pasar', jumlah: Number(product.stok_pasar) || 0 }
-    ]);
-    for (let index = 0; index < stocks.length; index += 100) {
-      const { error } = await supabase
-        .from('stok_lokasi')
-        .upsert(stocks.slice(index, index + 100), { onConflict: 'produk_id,lokasi' });
-      if (error) throw error;
-    }
-
-    await insertRows('transaksi', transactions.map((transaction) => ({
-      id: transaction.id,
-      tanggal: transaction.tanggal,
-      lokasi_penjualan: transaction.lokasi_penjualan,
-      total_harga: transaction.total_harga,
-      metode_pembayaran: transaction.metode_pembayaran,
-      status_pembayaran: transaction.status_pembayaran,
-      nama_pelanggan: transaction.nama_pelanggan || null,
-      bukti_pembayaran: transaction.bukti_pembayaran || null,
-      tanggal_pelunasan: transaction.tanggal_pelunasan || null,
-      created_at: transaction.created_at || undefined
-    })));
-    await insertRows('detail_transaksi', transactions.flatMap((transaction) => transaction.items.map((item) => ({
-      transaksi_id: transaction.id,
-      produk_id: item.produk_id,
-      jumlah: item.jumlah,
-      harga_beli_saat_ini: item.harga_beli_saat_ini,
-      harga_jual_saat_ini: item.harga_jual_saat_ini
-    }))));
-
-    await insertRows('pembelian_nota', purchases.map((purchase) => ({
-      id: purchase.id,
-      tanggal: purchase.tanggal,
-      nama_supplier: purchase.nama_supplier,
-      total_nota: purchase.total_nota,
-      status: purchase.status,
-      foto_nota: purchase.foto_nota || purchase.foto_nota_base64 || null,
-      tanggal_pelunasan: purchase.tanggal_pelunasan || null,
-      created_at: purchase.created_at || undefined
-    })));
-    await insertRows('detail_pembelian', purchases.flatMap((purchase) => purchase.items.map((item) => ({
-      pembelian_nota_id: purchase.id,
-      produk_id: item.produk_id,
-      jumlah: item.jumlah,
-      harga_beli: item.harga_beli,
-      lokasi_tujuan: item.lokasi_tujuan || null
-    }))));
-    await insertRows('pengeluaran', backup.expenses.map((expense) => ({
-      id: mapId(expense.id),
-      tanggal: expense.tanggal,
-      kategori: expense.kategori,
-      jumlah: expense.jumlah,
-      keterangan: expense.keterangan,
-      created_at: expense.created_at || undefined
-    })));
+      stok_belum_dialokasikan: Number(product.stok_belum_dialokasikan) || 0
+    })).sort((a, b) => a.nama.localeCompare(b.nama));
   },
 
-  // PRODUCTS
-  async getProducts() {
-    if (!isMock) {
-      // Cloud Supabase
-      const { data, error } = await supabase
-        .from('produk')
-        .select('*')
-        .order('nama', { ascending: true });
-      if (error) throw error;
+  async getTransactions() {
+    return (await getAll(COLLECTIONS.transactions)).sort(byNewest);
+  },
 
-      // Ambil stok per lokasi untuk digabung
-      const { data: stockData, error: stockError } = await supabase
-        .from('stok_lokasi')
-        .select('*');
-      if (stockError) throw stockError;
+  async getPurchases() {
+    return (await getAll(COLLECTIONS.purchases)).sort(byNewest);
+  },
 
-      // Gabungkan data produk dengan stoknya
-      return data.map(p => {
-        const stocks = stockData.filter(s => s.produk_id === p.id);
-        const stok_rumah = stocks.find(s => s.lokasi === 'Rumah')?.jumlah || 0;
-        const stok_pasar = stocks.find(s => s.lokasi === 'Pasar')?.jumlah || 0;
-        return {
-          ...p,
-          stok_rumah,
-          stok_pasar,
-          stok_belum_dialokasikan: Number(p.stok_belum_dialokasikan) || 0
-        };
-      });
-    } else {
-      // Mock LocalStorage
-      return getLocalData('toko_produk', INITIAL_PRODUCTS).map((product) => ({
-        ...product,
-        stok_belum_dialokasikan: Number(product.stok_belum_dialokasikan) || 0
-      }));
-    }
+  async getExpenses() {
+    return (await getAll(COLLECTIONS.expenses)).sort(byNewest);
+  },
+
+  async getAllData() {
+    const [products, transactions, purchases, expenses] = await Promise.all([
+      this.getProducts(),
+      this.getTransactions(),
+      this.getPurchases(),
+      this.getExpenses()
+    ]);
+    return { products, transactions, purchases, expenses };
   },
 
   async addProduct(product) {
-    const normalizedProduct = normalizeProduct(product);
-    if (normalizedProduct.stok_rumah !== 0 || normalizedProduct.stok_pasar !== 0) {
+    const normalized = normalizeProduct(product);
+    if (normalized.stok_rumah !== 0 || normalized.stok_pasar !== 0 ||
+        normalized.stok_belum_dialokasikan !== 0) {
       throw new Error('Produk baru harus dimulai dengan stok 0 dan stok hanya dapat ditambah lewat transaksi pembelian.');
     }
-    if (!isMock) {
-      // Cloud Supabase
-      const { data, error } = await supabase
-        .from('produk')
-        .insert([{
-          nama: normalizedProduct.nama,
-          kategori: normalizedProduct.kategori,
-          harga_beli_default: normalizedProduct.harga_beli_default,
-          stok_minimum: normalizedProduct.stok_minimum,
-          stok_belum_dialokasikan: 0
-        }])
-        .select()
-        .single();
-      if (error) throw error;
-
-      // Trigger database membuat stok lokasi awal. Upsert menjaga schema lama/baru tetap aman.
-      const { error: stockError } = await supabase
-        .from('stok_lokasi')
-        .upsert([
-          { produk_id: data.id, lokasi: 'Rumah', jumlah: normalizedProduct.stok_rumah },
-          { produk_id: data.id, lokasi: 'Pasar', jumlah: normalizedProduct.stok_pasar }
-        ], { onConflict: 'produk_id,lokasi' });
-      if (stockError) throw stockError;
-
-      return { ...data, stok_rumah: normalizedProduct.stok_rumah, stok_pasar: normalizedProduct.stok_pasar, stok_belum_dialokasikan: 0 };
-    } else {
-      // Mock LocalStorage
-      const products = getLocalData('toko_produk', INITIAL_PRODUCTS);
-      const newProduct = {
-        id: 'p_' + Math.random().toString(36).substr(2, 9),
-        ...normalizedProduct
-      };
-      products.push(newProduct);
-      setLocalData('toko_produk', products);
-      return newProduct;
-    }
+    const id = makeId('p');
+    await db.collection(COLLECTIONS.products).doc(id).create({
+      ...normalized,
+      created_at: now()
+    });
+    return { id, ...normalized };
   },
 
   async updateProduct(id, product) {
-    const normalizedProduct = normalizeProduct(product);
-    const existingProducts = await this.getProducts();
-    const existingProduct = existingProducts.find((entry) => String(entry.id) === String(id));
-    if (!existingProduct) throw new Error('Produk tidak ditemukan.');
-    if (normalizedProduct.harga_beli_default !== Number(existingProduct.harga_beli_default)) {
+    const productId = validateId(id, 'ID produk');
+    const normalized = normalizeProduct(product);
+    const existing = await getProduct(productId);
+    if (!existing) throw new Error('Produk tidak ditemukan.');
+    if (normalized.harga_beli_default !== Number(existing.harga_beli_default)) {
       throw new Error('Harga modal tidak dapat diubah manual. Harga modal dihitung otomatis dari transaksi pembelian.');
     }
-    const pendingStock = 0;
-    const proposedStockTotal = normalizedProduct.stok_rumah + normalizedProduct.stok_pasar;
-    const currentStockTotal = (Number(existingProduct.stok_rumah) || 0) +
-      (Number(existingProduct.stok_pasar) || 0) +
-      (Number(existingProduct.stok_belum_dialokasikan) || 0);
-    if (proposedStockTotal !== currentStockTotal) {
-      throw new Error(`Total stok tidak boleh berubah. Distribusikan tepat ${currentStockTotal} pcs antara Rumah dan Pasar.`);
+    const existingTotal = (Number(existing.stok_rumah) || 0) +
+      (Number(existing.stok_pasar) || 0) +
+      (Number(existing.stok_belum_dialokasikan) || 0);
+    if (normalized.stok_rumah + normalized.stok_pasar !== existingTotal) {
+      throw new Error(`Total stok tidak boleh berubah. Distribusikan tepat ${existingTotal} pcs antara Rumah dan Pasar.`);
     }
-    if (!isMock) {
-      // Cloud Supabase
-      const { error } = await supabase
-        .from('produk')
-        .update({
-          nama: normalizedProduct.nama,
-          kategori: normalizedProduct.kategori,
-          harga_beli_default: normalizedProduct.harga_beli_default,
-          stok_minimum: normalizedProduct.stok_minimum,
-          stok_belum_dialokasikan: pendingStock
-        })
-        .eq('id', id);
-      if (error) throw error;
-
-      // Update stok lokasi
-      const { error: errorRumah } = await supabase
-        .from('stok_lokasi')
-        .upsert({ produk_id: id, lokasi: 'Rumah', jumlah: normalizedProduct.stok_rumah }, { onConflict: 'produk_id,lokasi' });
-      if (errorRumah) throw errorRumah;
-
-      const { error: errorPasar } = await supabase
-        .from('stok_lokasi')
-        .upsert({ produk_id: id, lokasi: 'Pasar', jumlah: normalizedProduct.stok_pasar }, { onConflict: 'produk_id,lokasi' });
-      if (errorPasar) throw errorPasar;
-
-      return { id, ...normalizedProduct };
-    } else {
-      // Mock LocalStorage
-      const products = getLocalData('toko_produk', INITIAL_PRODUCTS);
-      const index = products.findIndex(p => p.id === id);
-      if (index !== -1) {
-        products[index] = { ...products[index], ...normalizedProduct, stok_belum_dialokasikan: pendingStock };
-        setLocalData('toko_produk', products);
-        return products[index];
-      }
-      throw new Error('Produk tidak ditemukan');
-    }
+    const updated = {
+      ...normalized,
+      stok_belum_dialokasikan: 0,
+      id: productId,
+      created_at: existing.created_at
+    };
+    await db.collection(COLLECTIONS.products).doc(productId).set(updated);
+    return updated;
   },
 
   async deleteProduct(id) {
-    if (!isMock) {
-      const { error } = await supabase
-        .from('produk')
-        .delete()
-        .eq('id', id);
-      if (error) throw error;
-      return true;
-    } else {
-      const products = getLocalData('toko_produk', INITIAL_PRODUCTS);
-      const filtered = products.filter(p => p.id !== id);
-      setLocalData('toko_produk', filtered);
-      return true;
-    }
-  },
-
-  // TRANSACTIONS
-  async getTransactions() {
-    if (!isMock) {
-      // Cloud Supabase
-      const { data, error } = await supabase
-        .from('transaksi')
-        .select(`
-          *,
-          detail_transaksi (
-            *,
-            produk (nama)
-          )
-        `)
-        .order('tanggal', { ascending: false });
-      if (error) throw error;
-
-      return data.map(t => ({
-        ...t,
-        items: t.detail_transaksi.map(d => ({
-          produk_id: d.produk_id,
-          nama_produk: d.produk?.nama || 'Produk Dihapus',
-          jumlah: d.jumlah,
-          harga_beli_saat_ini: d.harga_beli_saat_ini,
-          harga_jual_saat_ini: d.harga_jual_saat_ini
-        }))
-      }));
-    } else {
-      // Mock LocalStorage
-      return getLocalData('toko_transaksi', INITIAL_TRANSACTIONS);
-    }
+    await db.collection(COLLECTIONS.products).doc(validateId(id, 'ID produk')).delete();
+    return true;
   },
 
   async createTransaction(transaction) {
-    if (!['Rumah', 'Pasar'].includes(transaction.lokasi_penjualan)) {
+    if (!transaction || !['Rumah', 'Pasar'].includes(transaction.lokasi_penjualan)) {
       throw new Error('Lokasi penjualan tidak valid.');
     }
     if (!['Tunai', 'Transfer', 'Tempo'].includes(transaction.metode_pembayaran)) {
@@ -390,448 +158,288 @@ export const dbService = {
     if (!Array.isArray(transaction.items) || transaction.items.length === 0) {
       throw new Error('Transaksi harus memiliki setidaknya satu barang.');
     }
-
     const totalHarga = Number(transaction.total_harga);
-    if (!Number.isFinite(totalHarga) || totalHarga <= 0) {
-      throw new Error('Total transaksi harus lebih dari Rp0.');
-    }
+    if (!Number.isFinite(totalHarga) || totalHarga <= 0) throw new Error('Total transaksi harus lebih dari Rp0.');
 
-    const products = await this.getProducts();
-    const productById = new Map(products.map((product) => [String(product.id), product]));
-    const quantityByProduct = new Map();
+    const requested = new Map();
     let calculatedTotal = 0;
-    transaction.items.forEach((item) => {
-      const product = productById.get(String(item.produk_id));
-      if (!product) throw new Error(`Produk "${item.nama_produk || item.produk_id}" tidak ditemukan di katalog.`);
+    for (const item of transaction.items) {
+      const productId = validateId(item.produk_id, 'ID produk');
       const quantity = Number(item.jumlah);
-      if (!Number.isInteger(quantity) || quantity <= 0) {
-        throw new Error(`Jumlah "${product.nama}" harus bilangan bulat lebih dari 0.`);
-      }
       const salePrice = Number(item.harga_jual_saat_ini);
-      if (!Number.isInteger(salePrice) || salePrice <= 0) {
-        throw new Error(`Harga jual "${product.nama}" harus bilangan bulat lebih dari Rp0.`);
-      }
+      if (!Number.isInteger(quantity) || quantity <= 0) throw new Error('Jumlah barang harus bilangan bulat lebih dari 0.');
+      if (!Number.isInteger(salePrice) || salePrice <= 0) throw new Error('Harga jual harus bilangan bulat lebih dari Rp0.');
       calculatedTotal += quantity * salePrice;
-      quantityByProduct.set(String(product.id), (quantityByProduct.get(String(product.id)) || 0) + quantity);
-    });
+      const accumulated = requested.get(productId) || { quantity: 0, items: [] };
+      accumulated.quantity += quantity;
+      accumulated.items.push(item);
+      requested.set(productId, accumulated);
+    }
     if (Math.abs(totalHarga - calculatedTotal) > 0.01) {
       throw new Error('Total transaksi tidak sesuai dengan jumlah dan harga jual barang.');
     }
 
-    quantityByProduct.forEach((quantity, productId) => {
-      const product = productById.get(productId);
-      const availableStock = Number(transaction.lokasi_penjualan === 'Pasar' ? product.stok_pasar : product.stok_rumah) || 0;
-      if (quantity > availableStock) {
-        throw new Error(`Stok "${product.nama}" di ${transaction.lokasi_penjualan} tidak cukup. Tersedia ${availableStock}, diminta ${quantity}.`);
-      }
-    });
-
-    if (!isMock) {
-      // Cloud Supabase
-      // 1. Simpan Transaksi utama
-      const { data: newTx, error: txError } = await supabase
-        .from('transaksi')
-        .insert([{
-          lokasi_penjualan: transaction.lokasi_penjualan,
-          total_harga: transaction.total_harga,
-          metode_pembayaran: transaction.metode_pembayaran,
-          status_pembayaran: transaction.status_pembayaran,
-          nama_pelanggan: transaction.nama_pelanggan || null,
-          bukti_pembayaran: transaction.bukti_pembayaran || null,
-          tanggal: new Date().toISOString()
-        }])
-        .select()
-        .single();
-      if (txError) throw txError;
-
-      // 2. Simpan Detail Transaksi & Kurangi Stok Lokasi
-      for (const item of transaction.items) {
-        // Simpan detail
-        const { error: detailError } = await supabase
-          .from('detail_transaksi')
-          .insert([{
-            transaksi_id: newTx.id,
-            produk_id: item.produk_id,
-            jumlah: item.jumlah,
-            harga_beli_saat_ini: item.harga_beli_saat_ini,
-            harga_jual_saat_ini: item.harga_jual_saat_ini
-          }]);
-        if (detailError) throw detailError;
-
-        // Ambil stok lokasi saat ini untuk dikurangi
-        const { data: stockItem, error: fetchStockErr } = await supabase
-          .from('stok_lokasi')
-          .select('jumlah')
-          .eq('produk_id', item.produk_id)
-          .eq('lokasi', transaction.lokasi_penjualan)
-          .single();
-        if (fetchStockErr) throw fetchStockErr;
-
-        const newStockAmount = Math.max(0, stockItem.jumlah - item.jumlah);
-
-        // Update stok
-        const { error: updateStockErr } = await supabase
-          .from('stok_lokasi')
-          .update({ jumlah: newStockAmount })
-          .eq('produk_id', item.produk_id)
-          .eq('lokasi', transaction.lokasi_penjualan);
-        if (updateStockErr) throw updateStockErr;
-      }
-
-      return newTx;
-    } else {
-      // Mock LocalStorage
-      const transactions = getLocalData('toko_transaksi', INITIAL_TRANSACTIONS);
-      const newTx = {
-        id: 't_' + Math.random().toString(36).substr(2, 9),
-        tanggal: new Date().toISOString(),
-        ...transaction
-      };
-      transactions.unshift(newTx);
-      setLocalData('toko_transaksi', transactions);
-
-      // Kurangi stok produk
-      newTx.items.forEach(item => {
-        const prod = products.find(p => p.id === item.produk_id);
-        if (prod) {
-          if (newTx.lokasi_penjualan === 'Pasar') {
-            prod.stok_pasar -= item.jumlah;
-          } else {
-            prod.stok_rumah -= item.jumlah;
-          }
-        }
+    const id = makeId('t');
+    const transactionRef = db.collection(COLLECTIONS.transactions).doc(id);
+    await db.runTransaction(async (tx) => {
+      const productRefs = [...requested.keys()].map((productId) =>
+        db.collection(COLLECTIONS.products).doc(productId));
+      const productSnapshots = await Promise.all(productRefs.map((ref) => tx.get(ref)));
+      const productsById = new Map();
+      productSnapshots.forEach((snapshot) => {
+        if (snapshot.exists) productsById.set(snapshot.id, snapshot.data());
       });
-      setLocalData('toko_produk', products);
 
-      return newTx;
-    }
+      const items = [];
+      for (const [productId, request] of requested) {
+        const product = productsById.get(productId);
+        if (!product) throw new Error(`Produk "${productId}" tidak ditemukan di katalog.`);
+        const stockField = transaction.lokasi_penjualan === 'Pasar' ? 'stok_pasar' : 'stok_rumah';
+        const available = Number(product[stockField]) || 0;
+        if (request.quantity > available) {
+          throw new Error(`Stok "${product.nama}" di ${transaction.lokasi_penjualan} tidak cukup. Tersedia ${available}, diminta ${request.quantity}.`);
+        }
+        tx.update(db.collection(COLLECTIONS.products).doc(productId), {
+          [stockField]: available - request.quantity
+        });
+        for (const item of request.items) {
+          items.push({
+            produk_id: productId,
+            nama_produk: product.nama,
+            jumlah: Number(item.jumlah),
+            harga_beli_saat_ini: Number(item.harga_beli_saat_ini) || Number(product.harga_beli_default) || 0,
+            harga_jual_saat_ini: Number(item.harga_jual_saat_ini)
+          });
+        }
+      }
+      tx.create(transactionRef, {
+        tanggal: now(),
+        lokasi_penjualan: transaction.lokasi_penjualan,
+        total_harga: totalHarga,
+        metode_pembayaran: transaction.metode_pembayaran,
+        status_pembayaran: transaction.status_pembayaran,
+        nama_pelanggan: transaction.nama_pelanggan || null,
+        bukti_pembayaran: transaction.bukti_pembayaran || null,
+        tanggal_pelunasan: transaction.tanggal_pelunasan || null,
+        items
+      });
+    });
+    return { id, ...transaction, total_harga: totalHarga, tanggal: now() };
   },
 
   async updateTransactionStatus(id, status) {
-    if (!['Lunas', 'Belum Lunas'].includes(status)) {
-      throw new Error('Status pembayaran transaksi tidak valid.');
-    }
-    if (!isMock) {
-      const { error } = await supabase
-        .from('transaksi')
-        .update({
-          status_pembayaran: status,
-          tanggal_pelunasan: status === 'Lunas' ? new Date().toISOString() : null
-        })
-        .eq('id', id);
-      if (error) throw error;
-      return true;
-    } else {
-      const transactions = getLocalData('toko_transaksi', INITIAL_TRANSACTIONS);
-      const tx = transactions.find(t => t.id === id);
-      if (tx) {
-        tx.status_pembayaran = status;
-        tx.tanggal_pelunasan = status === 'Lunas' ? new Date().toISOString() : null;
-        setLocalData('toko_transaksi', transactions);
-        return true;
-      }
-      return false;
-    }
-  },
-
-  // PURCHASES (NOTA KULAKAN)
-  async getPurchases() {
-    if (!isMock) {
-      // Cloud Supabase
-      const { data, error } = await supabase
-        .from('pembelian_nota')
-        .select(`
-          *,
-          detail_pembelian (
-            *,
-            produk (nama)
-          )
-        `)
-        .order('tanggal', { ascending: false });
-      if (error) throw error;
-
-      return data.map(p => ({
-        ...p,
-        items: p.detail_pembelian.map(d => ({
-          produk_id: d.produk_id,
-          nama_produk: d.produk?.nama || 'Produk Dihapus',
-          jumlah: d.jumlah,
-          harga_beli: d.harga_beli,
-          lokasi_tujuan: d.lokasi_tujuan
-        }))
-      }));
-    } else {
-      // Mock LocalStorage
-      return getLocalData('toko_pembelian', INITIAL_PURCHASES);
-    }
+    if (!['Lunas', 'Belum Lunas'].includes(status)) throw new Error('Status pembayaran transaksi tidak valid.');
+    const transactionId = validateId(id, 'ID transaksi');
+    await db.collection(COLLECTIONS.transactions).doc(transactionId).update({
+      status_pembayaran: status,
+      tanggal_pelunasan: status === 'Lunas' ? now() : null
+    });
+    return true;
   },
 
   async createPurchase(purchase) {
-    if (!purchase.nama_supplier?.trim()) throw new Error('Nama supplier wajib diisi.');
+    if (!purchase?.nama_supplier?.trim()) throw new Error('Nama supplier wajib diisi.');
     if (!['Lunas', 'Tempo'].includes(purchase.status)) throw new Error('Status pembayaran pembelian tidak valid.');
     if (!Array.isArray(purchase.items) || purchase.items.length === 0) {
       throw new Error('Pembelian harus memiliki setidaknya satu barang.');
     }
 
-    const products = await this.getProducts();
-    const productById = new Map(products.map((product) => [String(product.id), product]));
-    const newProductByName = new Map();
-    const validatedItems = [];
-    for (const item of purchase.items) {
-      const name = String(item.nama_produk || '').trim();
-      const category = String(item.kategori || '').trim();
-      if (!name || !category) throw new Error('Nama dan jenis produk wajib diisi saat menerima barang.');
-      const quantity = Number(item.jumlah);
-      const price = Number(item.harga_beli);
-      if (!Number.isInteger(quantity) || quantity <= 0) throw new Error(`Jumlah "${name}" harus bilangan bulat lebih dari 0.`);
-      if (!Number.isFinite(price) || price < 0) throw new Error(`Harga beli "${name}" harus 0 atau lebih.`);
-      const lineTotal = item.total_harga === undefined ? price * quantity : Number(item.total_harga);
-      if (!Number.isFinite(lineTotal) || lineTotal < 0 || Math.abs(lineTotal - price * quantity) > 0.000001) {
-        throw new Error(`Total harga pembelian "${name}" tidak sesuai dengan jumlah dan harga satuan.`);
-      }
+    const id = makeId('b');
+    const purchaseRef = db.collection(COLLECTIONS.purchases).doc(id);
+    const productCollection = db.collection(COLLECTIONS.products);
+    let createdPurchase = null;
 
-      let product = item.produk_id ? productById.get(String(item.produk_id)) : null;
-      product ||= products.find((entry) => entry.nama.trim().toLocaleLowerCase() === name.toLocaleLowerCase());
-      const normalizedName = name.toLocaleLowerCase();
-      const pendingProduct = newProductByName.get(normalizedName);
-      if (!product && pendingProduct) product = pendingProduct;
-      if (product && product.nama.trim().toLocaleLowerCase() !== name.toLocaleLowerCase()) {
-        throw new Error(`Nama barang tidak cocok dengan produk katalog "${product.nama}".`);
-      }
-      if (product && product.kategori.trim().toLocaleLowerCase() !== category.toLocaleLowerCase()) {
-        throw new Error(`Jenis produk "${product.nama}" sudah terdaftar sebagai "${product.kategori}".`);
-      }
-      if (!product) {
-        newProductByName.set(normalizedName, { nama: name, kategori: category });
-      }
-      validatedItems.push({ name, category, quantity, price, lineTotal, product });
-    }
+    await db.runTransaction(async (tx) => {
+      const productSnapshots = await tx.get(productCollection);
+      const existingProducts = productSnapshots.docs.map(asRecord);
+      const byId = new Map(existingProducts.map((product) => [String(product.id), product]));
+      const byName = new Map(existingProducts.map((product) => [product.nama.trim().toLocaleLowerCase(), product]));
+      const plans = new Map();
+      const items = [];
 
-    const items = [];
-    const createdProductsByName = new Map();
-    for (const item of validatedItems) {
-      let product = item.product;
-      if (!products.includes(product)) {
-        product = createdProductsByName.get(item.name.toLocaleLowerCase());
-      }
-      if (!product) {
-        product = await this.addProduct({
-          nama: item.name,
-          kategori: item.category,
-          harga_beli_default: item.price,
-          stok_minimum: 5,
-          stok_rumah: 0,
-          stok_pasar: 0
+      for (const item of purchase.items) {
+        const name = String(item.nama_produk || '').trim();
+        const category = String(item.kategori || '').trim();
+        const quantity = Number(item.jumlah);
+        const price = Number(item.harga_beli);
+        if (!name || !category) throw new Error('Nama dan jenis produk wajib diisi saat menerima barang.');
+        if (!Number.isInteger(quantity) || quantity <= 0) throw new Error(`Jumlah "${name}" harus bilangan bulat lebih dari 0.`);
+        if (!Number.isFinite(price) || price < 0) throw new Error(`Harga beli "${name}" harus 0 atau lebih.`);
+        const lineTotal = item.total_harga === undefined ? price * quantity : Number(item.total_harga);
+        if (!Number.isFinite(lineTotal) || lineTotal < 0 || Math.abs(lineTotal - price * quantity) > 0.000001) {
+          throw new Error(`Total harga pembelian "${name}" tidak sesuai dengan jumlah dan harga satuan.`);
+        }
+
+        let product = item.produk_id ? byId.get(String(item.produk_id)) : null;
+        product ||= byName.get(name.toLocaleLowerCase());
+        if (product && product.nama.trim().toLocaleLowerCase() !== name.toLocaleLowerCase()) {
+          throw new Error(`Nama barang tidak cocok dengan produk katalog "${product.nama}".`);
+        }
+        if (product && product.kategori.trim().toLocaleLowerCase() !== category.toLocaleLowerCase()) {
+          throw new Error(`Jenis produk "${product.nama}" sudah terdaftar sebagai "${product.kategori}".`);
+        }
+        if (!product) {
+          const newId = makeId('p');
+          product = {
+            id: newId,
+            nama: name,
+            kategori: category,
+            harga_beli_default: price,
+            stok_minimum: 5,
+            stok_rumah: 0,
+            stok_pasar: 0,
+            stok_belum_dialokasikan: 0,
+            created_at: now()
+          };
+          byId.set(newId, product);
+          byName.set(name.toLocaleLowerCase(), product);
+        }
+
+        const productId = String(product.id);
+        const plan = plans.get(productId) || { product, quantity: 0, totalCost: 0 };
+        plan.quantity += quantity;
+        plan.totalCost += lineTotal;
+        plans.set(productId, plan);
+        items.push({
+          produk_id: productId,
+          nama_produk: product.nama,
+          kategori: product.kategori,
+          jumlah: quantity,
+          harga_beli: price,
+          total_harga: lineTotal,
+          lokasi_tujuan: null
         });
-        products.push(product);
-        productById.set(String(product.id), product);
-        createdProductsByName.set(item.name.toLocaleLowerCase(), product);
-      }
-      items.push({
-        produk_id: product.id,
-        nama_produk: product.nama,
-        kategori: product.kategori,
-        jumlah: item.quantity,
-        harga_beli: item.price,
-        total_harga: item.lineTotal,
-        lokasi_tujuan: null
-      });
-    }
-    const totalNota = items.reduce((sum, item) => sum + item.total_harga, 0);
-    const totalQuantityByProduct = new Map();
-    items.forEach((item) => {
-      const current = totalQuantityByProduct.get(item.produk_id) || { quantity: 0, totalCost: 0 };
-      current.quantity += item.jumlah;
-      current.totalCost += item.total_harga;
-      totalQuantityByProduct.set(item.produk_id, current);
-    });
-
-    const weightedCostByProduct = new Map();
-    totalQuantityByProduct.forEach((totals, productId) => {
-      const product = productById.get(String(productId));
-      const existingStock = (Number(product.stok_rumah) || 0) +
-        (Number(product.stok_pasar) || 0) +
-        (Number(product.stok_belum_dialokasikan) || 0);
-      const incomingQuantity = totals.quantity;
-      const averageCost = existingStock + incomingQuantity > 0
-        ? ((existingStock * Number(product.harga_beli_default || 0)) + totals.totalCost) / (existingStock + incomingQuantity)
-        : totals.totalCost / incomingQuantity;
-      weightedCostByProduct.set(String(productId), averageCost);
-    });
-
-    if (!isMock) {
-      // Cloud Supabase
-      // 1. Simpan Nota Pembelian
-      const { data: newPurchase, error: pError } = await supabase
-        .from('pembelian_nota')
-        .insert([{
-          nama_supplier: purchase.nama_supplier.trim(),
-          total_nota: totalNota,
-          status: purchase.status,
-          foto_nota: purchase.foto_nota || null,
-          tanggal: new Date().toISOString()
-        }])
-        .select()
-        .single();
-      if (pError) throw pError;
-
-      // 2. Simpan Detail & Tambah Stok & Update Harga Beli Default Produk
-      for (const item of items) {
-        const { error: detailError } = await supabase
-          .from('detail_pembelian')
-          .insert([{
-            pembelian_nota_id: newPurchase.id,
-            produk_id: item.produk_id,
-            jumlah: item.jumlah,
-            harga_beli: item.harga_beli,
-            lokasi_tujuan: null
-          }]);
-        if (detailError) throw detailError;
       }
 
-      for (const [productId, totals] of totalQuantityByProduct) {
-        const product = productById.get(String(productId));
-        const { error: updateProdErr } = await supabase
-          .from('produk')
-          .update({
-            harga_beli_default: weightedCostByProduct.get(String(productId)),
-            stok_belum_dialokasikan: (Number(product.stok_belum_dialokasikan) || 0) + totals.quantity
-          })
-          .eq('id', productId);
-        if (updateProdErr) throw updateProdErr;
+      const totalNota = items.reduce((sum, item) => sum + item.total_harga, 0);
+      const timestamp = now();
+      for (const [productId, plan] of plans) {
+        const productRef = productCollection.doc(productId);
+        const existing = productSnapshots.docs.find((snapshot) => snapshot.id === productId);
+        if (!existing) {
+          plan.product.stok_belum_dialokasikan = plan.quantity;
+          plan.product.harga_beli_default = plan.totalCost / plan.quantity;
+          tx.create(productRef, plan.product);
+        } else {
+          const currentStock = (Number(plan.product.stok_rumah) || 0) +
+            (Number(plan.product.stok_pasar) || 0) +
+            (Number(plan.product.stok_belum_dialokasikan) || 0);
+          const averageCost = currentStock + plan.quantity > 0
+            ? ((currentStock * Number(plan.product.harga_beli_default || 0)) + plan.totalCost) /
+              (currentStock + plan.quantity)
+            : plan.totalCost / plan.quantity;
+          tx.update(productRef, {
+            stok_belum_dialokasikan: (Number(plan.product.stok_belum_dialokasikan) || 0) + plan.quantity,
+            harga_beli_default: averageCost
+          });
+        }
       }
 
-      return newPurchase;
-    } else {
-      // Mock LocalStorage
-      const purchases = getLocalData('toko_pembelian', INITIAL_PURCHASES);
-      const newPurchase = {
-        id: 'b_' + Math.random().toString(36).substr(2, 9),
-        tanggal: new Date().toISOString(),
+      createdPurchase = {
+        id,
+        tanggal: timestamp,
         nama_supplier: purchase.nama_supplier.trim(),
         status: purchase.status,
         foto_nota: purchase.foto_nota || null,
         total_nota: totalNota,
+        tanggal_pelunasan: purchase.tanggal_pelunasan || null,
         items
       };
-      purchases.unshift(newPurchase);
-      setLocalData('toko_pembelian', purchases);
+      tx.create(purchaseRef, createdPurchase);
+    });
 
-      const products = getLocalData('toko_produk', INITIAL_PRODUCTS);
-      totalQuantityByProduct.forEach((totals, productId) => {
-        const product = products.find((entry) => String(entry.id) === String(productId));
-        if (product) {
-          product.stok_belum_dialokasikan = (Number(product.stok_belum_dialokasikan) || 0) + totals.quantity;
-          product.harga_beli_default = weightedCostByProduct.get(String(productId));
-        }
-      });
-      setLocalData('toko_produk', products);
-
-      // Fix #2: Tambahkan return agar caller mendapatkan data nota baru
-      return newPurchase;
-    }
+    return createdPurchase;
   },
 
   async updatePurchaseStatus(id, status) {
-    if (!['Lunas', 'Tempo'].includes(status)) {
-      throw new Error('Status pembayaran pembelian tidak valid.');
-    }
-    if (!isMock) {
-      const { error } = await supabase
-        .from('pembelian_nota')
-        .update({
-          status: status,
-          // Fix #3: Gunakan tanggal_pelunasan, BUKAN overwrite tanggal asli
-          tanggal_pelunasan: status === 'Lunas' ? new Date().toISOString() : null
-        })
-        .eq('id', id);
-      if (error) throw error;
-      return true;
-    } else {
-      const purchases = getLocalData('toko_pembelian', INITIAL_PURCHASES);
-      const pur = purchases.find(p => p.id === id);
-      if (pur) {
-        pur.status = status;
-        // Fix #3: Simpan ke tanggal_pelunasan, BUKAN menimpa tanggal asli
-        if (status === 'Lunas') {
-          pur.tanggal_pelunasan = new Date().toISOString();
-        } else {
-          pur.tanggal_pelunasan = null;
-        }
-        setLocalData('toko_pembelian', purchases);
-        return true;
-      }
-      return false;
-    }
-  },
-
-  // EXPENSES
-  async getExpenses() {
-    if (!isMock) {
-      // Cloud Supabase
-      const { data, error } = await supabase
-        .from('pengeluaran')
-        .select('*')
-        .order('tanggal', { ascending: false });
-      if (error) throw error;
-      return data;
-    } else {
-      // Mock LocalStorage
-      return getLocalData('toko_pengeluaran', INITIAL_EXPENSES);
-    }
+    if (!['Lunas', 'Tempo'].includes(status)) throw new Error('Status pembayaran pembelian tidak valid.');
+    const purchaseId = validateId(id, 'ID pembelian');
+    await db.collection(COLLECTIONS.purchases).doc(purchaseId).update({
+      status,
+      tanggal_pelunasan: status === 'Lunas' ? now() : null
+    });
+    return true;
   },
 
   async addExpense(expense) {
-    const category = String(expense.kategori || '').trim();
-    const amount = Number(expense.jumlah);
+    const category = String(expense?.kategori || '').trim();
+    const amount = Number(expense?.jumlah);
     if (!category) throw new Error('Kategori pengeluaran wajib diisi.');
-    if (!Number.isFinite(amount) || amount <= 0) {
-      throw new Error('Jumlah pengeluaran harus lebih dari Rp0.');
-    }
-    if (!isMock) {
-      // Cloud Supabase
-      const { data, error } = await supabase
-        .from('pengeluaran')
-        .insert([{
-          kategori: category,
-          jumlah: amount,
-          keterangan: expense.keterangan,
-          tanggal: new Date().toISOString()
-        }])
-        .select()
-        .single();
-      if (error) throw error;
-      return data;
-    } else {
-      // Mock LocalStorage
-      const expenses = getLocalData('toko_pengeluaran', INITIAL_EXPENSES);
-      const newExpense = {
-        id: 'e_' + Math.random().toString(36).substr(2, 9),
-        tanggal: new Date().toISOString(),
-        ...expense,
-        kategori: category,
-        jumlah: amount
-      };
-      expenses.unshift(newExpense);
-      setLocalData('toko_pengeluaran', expenses);
-      return newExpense;
-    }
+    if (!Number.isFinite(amount) || amount <= 0) throw new Error('Jumlah pengeluaran harus lebih dari Rp0.');
+    const id = makeId('e');
+    const data = {
+      id,
+      kategori: category,
+      jumlah: amount,
+      keterangan: String(expense.keterangan || ''),
+      tanggal: now()
+    };
+    await db.collection(COLLECTIONS.expenses).doc(id).create(data);
+    return data;
   },
 
-  // Fix #3/#15: Hapus pengeluaran (baru)
   async deleteExpense(id) {
-    if (!isMock) {
-      const { error } = await supabase
-        .from('pengeluaran')
-        .delete()
-        .eq('id', id);
-      if (error) throw error;
-      return true;
-    } else {
-      const expenses = getLocalData('toko_pengeluaran', INITIAL_EXPENSES);
-      const filtered = expenses.filter(e => e.id !== id);
-      setLocalData('toko_pengeluaran', filtered);
-      return true;
+    await db.collection(COLLECTIONS.expenses).doc(validateId(id, 'ID pengeluaran')).delete();
+    return true;
+  },
+
+  async replaceAllData(backup) {
+    if (!backup || !['products', 'transactions', 'purchases', 'expenses']
+      .every((key) => Array.isArray(backup[key]))) {
+      throw new Error('Isi backup tidak lengkap atau tidak valid.');
+    }
+    const targets = [
+      [COLLECTIONS.products, backup.products],
+      [COLLECTIONS.transactions, backup.transactions],
+      [COLLECTIONS.purchases, backup.purchases],
+      [COLLECTIONS.expenses, backup.expenses]
+    ];
+    for (const [name, rows] of targets) {
+      const collection = db.collection(name);
+      const existing = await collection.get();
+      for (let start = 0; start < existing.docs.length; start += 450) {
+        const batch = db.batch();
+        existing.docs.slice(start, start + 450).forEach((snapshot) => batch.delete(snapshot.ref));
+        await batch.commit();
+      }
+      for (let start = 0; start < rows.length; start += 450) {
+        const batch = db.batch();
+        rows.slice(start, start + 450).forEach((row) => {
+          const id = validateId(row.id || makeId(name), `ID ${name}`);
+          batch.set(collection.doc(id), { ...row, id });
+        });
+        await batch.commit();
+      }
     }
   }
+};
+
+export const registerWriteAttempt = async (ipHash, success) => {
+  if (!db) throw new Error('Firebase Admin belum dikonfigurasi.');
+  const ref = db.collection(COLLECTIONS.attempts).doc(ipHash);
+  return db.runTransaction(async (tx) => {
+    const snapshot = await tx.get(ref);
+    const timestamp = Date.now();
+    const previous = snapshot.exists ? snapshot.data() : {};
+    const blockedUntil = Number(previous.blockedUntil) || 0;
+    if (blockedUntil > timestamp) return false;
+
+    const windowStartedAt = Number(previous.windowStartedAt) || timestamp;
+    const attempts = windowStartedAt < timestamp - 15 * 60 * 1000
+      ? 0
+      : Number(previous.failedAttempts) || 0;
+
+    if (success) {
+      tx.set(ref, { failedAttempts: 0, windowStartedAt: timestamp, blockedUntil: 0 });
+      return true;
+    }
+
+    const nextAttempts = attempts + 1;
+    tx.set(ref, {
+      failedAttempts: nextAttempts,
+      windowStartedAt: attempts === 0 ? timestamp : windowStartedAt,
+      blockedUntil: nextAttempts >= 5 ? timestamp + 15 * 60 * 1000 : 0
+    });
+    return nextAttempts < 5;
+  });
 };
