@@ -1,7 +1,32 @@
 const AUTOMATION_MARKER_KEY = 'kodri_demo_automation_last_run';
 const PURCHASE_MARKER_KEY = `${AUTOMATION_MARKER_KEY}_purchase`;
 const EXPENSE_MARKER_KEY = `${AUTOMATION_MARKER_KEY}_expense`;
-const AUTOMATED_SOURCE = 'Simulasi otomatis (DEMO)';
+const isAutomatedRecord = (record) =>
+  record.sumber_data === 'Simulasi otomatis (DEMO)' ||
+  /^(t|b|e)_(demo_)?auto_/.test(String(record.id || ''));
+
+const removeAutomationLabel = (record) => {
+  if (!isAutomatedRecord(record)) return record;
+  const cleanedDescription = typeof record.keterangan === 'string'
+    ? record.keterangan.replace(/\s*\(Simulasi portofolio\)$/i, '')
+    : record.keterangan;
+  if (!('sumber_data' in record) && cleanedDescription === record.keterangan) return record;
+
+  const cleaned = { ...record };
+  delete cleaned.sumber_data;
+  cleaned.keterangan = cleanedDescription;
+  return cleaned;
+};
+
+const cleanAutomationLabels = (records) => {
+  let changed = false;
+  const cleaned = records.map((record) => {
+    const next = removeAutomationLabel(record);
+    if (next !== record) changed = true;
+    return next;
+  });
+  return { records: cleaned, changed };
+};
 const MARKET_ROUTE_BY_DAY = {
   0: 'Talang Padang',
   1: 'Karang Dapo',
@@ -52,10 +77,10 @@ const median = (values) => {
     : sorted[middle]);
 };
 
-const getTransactionsPerDay = (transactions, location, weekday, beforeDate) => {
+const getTransactionsPerDay = (transactions, location, weekday, beforeDate, dateKey) => {
   const counts = new Map();
   transactions.forEach((transaction) => {
-    if (transaction.lokasi_penjualan !== location || transaction.sumber_data === AUTOMATED_SOURCE) return;
+    if (transaction.lokasi_penjualan !== location || isAutomatedRecord(transaction)) return;
     const transactionDate = new Date(transaction.tanggal);
     if (Number.isNaN(transactionDate.getTime()) || transactionDate >= beforeDate || transactionDate.getDay() !== weekday) return;
     const key = localDateKey(transactionDate);
@@ -65,7 +90,12 @@ const getTransactionsPerDay = (transactions, location, weekday, beforeDate) => {
     .sort(([first], [second]) => second.localeCompare(first))
     .slice(0, 8)
     .map(([, count]) => count);
-  return Math.max(1, Math.min(3, median(recentCounts)));
+  const typicalCount = median(recentCounts);
+  if (location !== 'Pasar') return Math.max(1, Math.min(3, typicalCount));
+
+  const marketBaseline = Math.max(7, typicalCount);
+  const variation = (hashValue(`${dateKey}:market-volume`) % 3) - 1;
+  return Math.max(6, Math.min(18, marketBaseline + variation));
 };
 
 const isOnDate = (value, date) => {
@@ -77,7 +107,7 @@ const getRecentTemplates = (records, date, weekday, dateField = 'tanggal') => {
   const validRecords = records
     .filter((record) => {
       const recordDate = new Date(record[dateField]);
-      return record.sumber_data !== AUTOMATED_SOURCE &&
+      return !isAutomatedRecord(record) &&
         !Number.isNaN(recordDate.getTime()) &&
         recordDate < new Date(date.getFullYear(), date.getMonth(), date.getDate());
     })
@@ -124,7 +154,7 @@ const generatePurchase = ({ purchases, productsById, date, dateKey, weekday }) =
   const hour = 9 + (seed % 7);
   const minute = (seed >>> 16) % 60;
   const purchaseDate = new Date(date.getFullYear(), date.getMonth(), date.getDate(), hour, minute);
-  const purchaseId = `b_demo_auto_${dateKey.replace(/-/g, '')}`;
+  const purchaseId = `b_auto_${dateKey.replace(/-/g, '')}`;
   if (purchases.some((purchase) => purchase.id === purchaseId)) return null;
 
   const totalsByProduct = new Map();
@@ -155,7 +185,6 @@ const generatePurchase = ({ purchases, productsById, date, dateKey, weekday }) =
     status: template.status === 'Tempo' ? 'Tempo' : 'Lunas',
     tanggal_pelunasan: template.status === 'Lunas' ? purchaseDate.toISOString() : null,
     foto_nota: null,
-    sumber_data: AUTOMATED_SOURCE,
     items
   };
 };
@@ -174,12 +203,11 @@ const generateExpense = ({ expenses, date, dateKey, weekday }) => {
   const minute = (seed >>> 16) % 60;
   const expenseDate = new Date(date.getFullYear(), date.getMonth(), date.getDate(), hour, minute);
   return {
-    id: `e_demo_auto_${dateKey.replace(/-/g, '')}`,
+    id: `e_auto_${dateKey.replace(/-/g, '')}`,
     tanggal: expenseDate.toISOString(),
     kategori: template.kategori,
     jumlah: amount,
-    keterangan: `${template.keterangan || template.kategori} (Simulasi portofolio)`,
-    sumber_data: AUTOMATED_SOURCE
+    keterangan: template.keterangan || template.kategori
   };
 };
 
@@ -191,10 +219,11 @@ const buildTransaction = ({
   location,
   routeName,
   sequence,
+  transactionCount,
   transactions
 }) => {
   const seed = hashValue(`${dateKey}:${location}:${sequence}`);
-  const id = `t_demo_auto_${dateKey.replace(/-/g, '')}_${location.toLowerCase()}_${sequence + 1}`;
+  const id = `t_auto_${dateKey.replace(/-/g, '')}_${location.toLowerCase()}_${sequence + 1}`;
   if (transactions.some((transaction) => transaction.id === id)) return null;
   const itemCandidates = [...(template.items || [])]
     .sort((first, second) => String(first.produk_id).localeCompare(String(second.produk_id)));
@@ -236,9 +265,28 @@ const buildTransaction = ({
   stockDeductions.forEach(({ product, stockKey, quantity }) => {
     product[stockKey] -= quantity;
   });
-  const hour = location === 'Pasar' ? 9 + (seed % 6) : 8 + (seed % 13);
-  const minute = (seed >>> 16) % 60;
-  const transactionDate = new Date(date.getFullYear(), date.getMonth(), date.getDate(), hour, minute);
+  let transactionDate;
+  if (location === 'Pasar') {
+    const marketOpens = 4 * 60 + 30;
+    const marketCloses = 14 * 60 + 45;
+    const openingJitter = seed % 21;
+    const closingJitter = (seed >>> 16) % 21;
+    const firstMinute = marketOpens + openingJitter;
+    const lastMinute = marketCloses - closingJitter;
+    const interval = (lastMinute - firstMinute) / Math.max(transactionCount - 1, 1);
+    const nominalMinute = firstMinute + interval * sequence;
+    const jitterRange = Math.min(18, interval * 0.2);
+    const jitter = transactionCount > 2 && sequence > 0 && sequence < transactionCount - 1
+      ? ((hashValue(`${dateKey}:market-time:${sequence}`) % 1001) / 500 - 1) * jitterRange
+      : 0;
+    const totalMinutes = Math.round(nominalMinute + jitter);
+    transactionDate = new Date(date.getFullYear(), date.getMonth(), date.getDate(),
+      Math.floor(totalMinutes / 60), totalMinutes % 60);
+  } else {
+    const hour = 8 + (seed % 13);
+    const minute = (seed >>> 16) % 60;
+    transactionDate = new Date(date.getFullYear(), date.getMonth(), date.getDate(), hour, minute);
+  }
   const sourceName = String(template.nama_pelanggan || '').trim();
   const customerName = location === 'Pasar'
     ? (/^umum\b/i.test(sourceName) ? `Umum - Kalangan ${routeName}` : sourceName || 'Umum')
@@ -255,14 +303,15 @@ const buildTransaction = ({
     nama_pelanggan: customerName,
     tanggal_pelunasan: null,
     bukti_pembayaran: null,
-    sumber_data: AUTOMATED_SOURCE,
     items
   };
 };
 
 export const runDailyDemoAutomation = (now = new Date()) => {
   const dateKey = localDateKey(now);
-  const transactions = readLocalArray('toko_transaksi');
+  const originalTransactions = readLocalArray('toko_transaksi');
+  const transactionCleanup = cleanAutomationLabels(originalTransactions);
+  const transactions = transactionCleanup.records;
   const products = readLocalArray('toko_produk');
   const dayStart = new Date(now.getFullYear(), now.getMonth(), now.getDate());
   const weekday = now.getDay();
@@ -291,7 +340,7 @@ export const runDailyDemoAutomation = (now = new Date()) => {
         return;
       }
 
-      const transactionCount = getTransactionsPerDay(transactions, location, weekday, dayStart);
+      const transactionCount = getTransactionsPerDay(transactions, location, weekday, dayStart, dateKey);
       const countSeed = hashValue(`${dateKey}:${location}:count`);
       for (let sequence = 0; sequence < transactionCount; sequence += 1) {
         const template = templates[(countSeed + sequence) % templates.length];
@@ -303,6 +352,7 @@ export const runDailyDemoAutomation = (now = new Date()) => {
           location,
           routeName: marketRoute,
           sequence,
+          transactionCount,
           transactions: [...transactions, ...createdTransactions]
         });
         if (generated) createdTransactions.push(generated);
@@ -311,8 +361,12 @@ export const runDailyDemoAutomation = (now = new Date()) => {
     });
   }
 
-  const purchases = readLocalArray('toko_pembelian');
-  const expenses = readLocalArray('toko_pengeluaran');
+  const originalPurchases = readLocalArray('toko_pembelian');
+  const purchaseCleanup = cleanAutomationLabels(originalPurchases);
+  const purchases = purchaseCleanup.records;
+  const originalExpenses = readLocalArray('toko_pengeluaran');
+  const expenseCleanup = cleanAutomationLabels(originalExpenses);
+  const expenses = expenseCleanup.records;
   const purchaseAlreadyProcessed = localStorage.getItem(PURCHASE_MARKER_KEY) === dateKey;
   const hasPurchaseToday = purchases.some((purchase) => isOnDate(purchase.tanggal, now));
   const newPurchase = purchaseAlreadyProcessed || hasPurchaseToday
@@ -328,9 +382,9 @@ export const runDailyDemoAutomation = (now = new Date()) => {
   const updatedExpenses = newExpense ? [newExpense, ...expenses] : expenses;
   const updatedProducts = products.map((product) => productsById.get(String(product.id)) || product);
   localStorage.setItem('toko_produk', JSON.stringify(updatedProducts));
-  if (createdTransactions.length > 0) localStorage.setItem('toko_transaksi', JSON.stringify(updatedTransactions));
-  if (newPurchase) localStorage.setItem('toko_pembelian', JSON.stringify(updatedPurchases));
-  if (newExpense) localStorage.setItem('toko_pengeluaran', JSON.stringify(updatedExpenses));
+  if (transactionCleanup.changed || createdTransactions.length > 0) localStorage.setItem('toko_transaksi', JSON.stringify(updatedTransactions));
+  if (purchaseCleanup.changed || newPurchase) localStorage.setItem('toko_pembelian', JSON.stringify(updatedPurchases));
+  if (expenseCleanup.changed || newExpense) localStorage.setItem('toko_pengeluaran', JSON.stringify(updatedExpenses));
   if (salesAlreadyProcessed || hasTransactionToday || createdTransactions.length > 0) {
     localStorage.setItem(AUTOMATION_MARKER_KEY, dateKey);
   }

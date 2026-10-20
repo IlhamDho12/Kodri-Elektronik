@@ -21,7 +21,6 @@ const SHEET_FIELDS = {
     ['metode_pembayaran', 'Metode pembayaran'],
     ['status_pembayaran', 'Status pembayaran'],
     ['nama_pelanggan', 'Nama pelanggan'],
-    ['sumber_data', 'Sumber data'],
     ['tanggal_pelunasan', 'Tanggal pelunasan'],
     ['created_at', 'Dibuat pada']
   ],
@@ -40,7 +39,6 @@ const SHEET_FIELDS = {
     ['total_nota', 'Total nota'],
     ['status', 'Status'],
     ['tanggal_pelunasan', 'Tanggal pelunasan'],
-    ['sumber_data', 'Sumber data'],
     ['created_at', 'Dibuat pada']
   ],
   'Detail Pembelian': [
@@ -57,7 +55,6 @@ const SHEET_FIELDS = {
     ['kategori', 'Kategori'],
     ['jumlah', 'Jumlah'],
     ['keterangan', 'Keterangan'],
-    ['sumber_data', 'Sumber data'],
     ['created_at', 'Dibuat pada']
   ],
   Lampiran: [
@@ -70,9 +67,7 @@ const SHEET_FIELDS = {
 };
 const OPTIONAL_SHEET_FIELDS = {
   Produk: new Set(['Stok belum dialokasikan']),
-  Transaksi: new Set(['Sumber data']),
-  Pembelian: new Set(['Tanggal pelunasan', 'Sumber data']),
-  Pengeluaran: new Set(['Sumber data'])
+  Pembelian: new Set(['Tanggal pelunasan'])
 };
 
 const dateFields = new Set(['tanggal', 'tanggal_pelunasan', 'created_at']);

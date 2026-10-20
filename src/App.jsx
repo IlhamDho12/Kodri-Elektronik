@@ -239,9 +239,9 @@ function App() {
           automationResult.expenseCreated ? '1 pengeluaran' : null
         ].filter(Boolean);
         if (generatedParts.length > 0) {
-          showToast(`Simulasi DEMO ${automationResult.dateKey}: ${generatedParts.join(', ')}.`, 'success');
+          showToast(`Data otomatis ${automationResult.dateKey}: ${generatedParts.join(', ')}.`, 'success');
         } else if (automationResult.skippedLocations?.length > 0 || automationResult.skippedPurchase || automationResult.skippedExpense) {
-          showToast('Sebagian data simulasi DEMO tidak dibuat karena stok atau riwayat yang cocok tidak tersedia.', 'error');
+          showToast('Sebagian data otomatis tidak dibuat karena stok atau riwayat yang cocok tidak tersedia.', 'error');
         }
       }
       const prods = await dbService.getProducts();
@@ -656,7 +656,6 @@ function App() {
                   <td>{new Date(transaction.tanggal).toLocaleString('id-ID', { dateStyle: 'medium', timeStyle: 'short' })}</td>
                   <td>
                     {transaction.nama_pelanggan || 'Umum'}
-                    {transaction.sumber_data === 'Simulasi otomatis (DEMO)' && <small>DEMO</small>}
                     {transaction.items?.length ? <small>{transaction.items.map((item) => `${item.nama_produk} (${item.jumlah})`).join(', ')}</small> : null}
                   </td>
                   <td>{transaction.lokasi_penjualan}</td>
@@ -677,7 +676,7 @@ function App() {
                 <tr key={purchase.id}>
                   <td>{index + 1}</td>
                   <td>{new Date(purchase.status === 'Lunas' ? purchase.tanggal_pelunasan || purchase.tanggal : purchase.tanggal).toLocaleDateString('id-ID', { dateStyle: 'medium' })}</td>
-                  <td>{purchase.nama_supplier}{purchase.sumber_data === 'Simulasi otomatis (DEMO)' ? ' · DEMO' : ''}</td>
+                  <td>{purchase.nama_supplier}</td>
                   <td>{purchase.status === 'Lunas' ? `Lunas${purchase.tanggal_pelunasan ? ` · ${new Date(purchase.tanggal_pelunasan).toLocaleDateString('id-ID')}` : ''}` : 'Tempo / belum dibayar'}</td>
                   <td>{purchase.items?.map((item) => `${item.nama_produk} (${item.jumlah})`).join(', ') || '-'}</td>
                   <td className="amount">{formatRupiah(purchase.total_nota)}</td>
@@ -697,7 +696,7 @@ function App() {
                   <td>{index + 1}</td>
                   <td>{new Date(expense.tanggal).toLocaleDateString('id-ID', { dateStyle: 'medium' })}</td>
                   <td>{expense.kategori}</td>
-                  <td>{expense.keterangan || '-'}{expense.sumber_data === 'Simulasi otomatis (DEMO)' ? ' · DEMO' : ''}</td>
+                  <td>{expense.keterangan || '-'}</td>
                   <td className="amount">{formatRupiah(expense.jumlah)}</td>
                 </tr>
               ))}
@@ -1570,9 +1569,6 @@ function DashboardView({ products, transactions, purchases, expenses, formatRupi
                       <tr key={p.id}>
                         <td style={{ fontWeight: 'bold' }}>
                           {p.nama_supplier}
-                          {p.sumber_data === 'Simulasi otomatis (DEMO)' && (
-                            <span className="badge badge-warning" style={{ marginLeft: '6px', fontSize: '0.68rem' }}>DEMO</span>
-                          )}
                         </td>
                         <td style={{ color: 'var(--color-danger)', fontWeight: 'bold' }}>{formatRupiah(p.total_nota)}</td>
                         <td style={{ fontSize: '0.8rem', color: 'var(--text-muted)' }}>
@@ -1779,9 +1775,6 @@ function DashboardView({ products, transactions, purchases, expenses, formatRupi
                               <td style={{ fontSize: '0.8rem' }}>{new Date(p.tanggal_pelunasan || p.tanggal).toLocaleDateString('id-ID', { day: 'numeric', month: 'short' })}</td>
                               <td style={{ fontWeight: '600' }}>
                                 {p.nama_supplier}
-                                {p.sumber_data === 'Simulasi otomatis (DEMO)' && (
-                                  <span className="badge badge-warning" style={{ marginLeft: '6px', fontSize: '0.68rem' }}>DEMO</span>
-                                )}
                               </td>
                               <td style={{ fontSize: '0.8rem' }}>{p.items?.map(i => `${i.nama_produk} (${i.jumlah} pcs)`).join(', ')}</td>
                               <td style={{ fontWeight: 'bold', color: 'var(--color-danger)' }}>{formatRupiah(p.total_nota)}</td>
@@ -1815,9 +1808,6 @@ function DashboardView({ products, transactions, purchases, expenses, formatRupi
                               <td><span className="badge badge-warning">{e.kategori}</span></td>
                               <td style={{ fontSize: '0.8rem' }}>
                                 {e.keterangan || '-'}
-                                {e.sumber_data === 'Simulasi otomatis (DEMO)' && (
-                                  <span className="badge badge-warning" style={{ marginLeft: '6px', fontSize: '0.68rem' }}>DEMO</span>
-                                )}
                               </td>
                               <td style={{ fontWeight: 'bold', color: 'var(--color-danger)' }}>{formatRupiah(e.jumlah)}</td>
                             </tr>
@@ -1903,9 +1893,6 @@ function DashboardView({ products, transactions, purchases, expenses, formatRupi
                             <tr key={p.id}>
                               <td style={{ fontWeight: 'bold' }}>
                                 {p.nama_supplier}
-                                {p.sumber_data === 'Simulasi otomatis (DEMO)' && (
-                                  <span className="badge badge-warning" style={{ marginLeft: '6px', fontSize: '0.68rem' }}>DEMO</span>
-                                )}
                               </td>
                               <td style={{ color: 'var(--color-danger)', fontWeight: 'bold' }}>{formatRupiah(p.total_nota)}</td>
                               <td style={{ fontSize: '0.8rem', color: 'var(--text-muted)' }}>
@@ -2467,9 +2454,6 @@ function PosView({ products, transactions, formatRupiah, fetchData, setLastTxDat
                       </td>
                       <td style={{ fontWeight: '600' }}>
                         {tx.nama_pelanggan || 'Umum'}
-                        {tx.sumber_data === 'Simulasi otomatis (DEMO)' && (
-                          <span className="badge badge-warning" style={{ marginLeft: '6px', fontSize: '0.68rem' }}>DEMO</span>
-                        )}
                       </td>
                       <td style={{ fontSize: '0.85rem', maxWidth: '300px', whiteSpace: 'nowrap', overflow: 'hidden', textOverflow: 'ellipsis' }}>
                         {tx.items?.map(i => `${i.nama_produk} (${i.jumlah} pcs)`).join(', ')}
@@ -3105,9 +3089,6 @@ function PurchasesView({ products, purchases, formatRupiah, fetchData, showToast
                       </td>
                       <td style={{ fontWeight: 'bold' }}>
                         {p.nama_supplier}
-                        {p.sumber_data === 'Simulasi otomatis (DEMO)' && (
-                          <span className="badge badge-warning" style={{ marginLeft: '6px', fontSize: '0.68rem' }}>DEMO</span>
-                        )}
                       </td>
                       <td style={{ fontSize: '0.85rem', maxWidth: '300px', whiteSpace: 'nowrap', overflow: 'hidden', textOverflow: 'ellipsis' }}>
                         {p.items?.map(i => `${i.nama_produk} (${i.jumlah} pcs)`).join(', ')}
@@ -3278,9 +3259,6 @@ function ExpensesView({ expenses, formatRupiah, fetchData, showToast, showConfir
                       <td style={{ fontWeight: '600', color: 'var(--color-danger)' }}>{formatRupiah(e.jumlah)}</td>
                       <td>
                         {e.keterangan || '-'}
-                        {e.sumber_data === 'Simulasi otomatis (DEMO)' && (
-                          <span className="badge badge-warning" style={{ marginLeft: '6px', fontSize: '0.68rem' }}>DEMO</span>
-                        )}
                       </td>
                       {/* Fix #3: Tombol hapus pengeluaran */}
                       <td className="no-print">
